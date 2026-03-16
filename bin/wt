@@ -1,0 +1,393 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "Usage:"
+  echo "  wt new <name> [--cursor] [--code]   Create a worktree"
+  echo "  wt rm [name]                        Remove a worktree (default: current)"
+  echo "  wt cd <name>                        cd into an existing worktree"
+  echo "  wt ls                               List all worktrees"
+  echo "  wt init [name]                      Run init script for a worktree (default: current)"
+  echo "  wt clone <url> [name]               Bare clone + initial worktree, cd into it"
+  echo "  wt migrate                          Convert current regular repo to bare structure"
+  echo "  wt pr <github-pr-url>               Open a PR review worktree and launch Claude"
+  echo ""
+  echo "Create options:"
+  echo "  --cursor    Open the worktree in Cursor"
+  echo "  --code      Open the worktree in VSCode"
+  exit 1
+}
+
+# Resolve git common dir to an absolute path from a given directory
+resolve_common_dir() {
+  local cwd="$1"
+  local common_dir
+  common_dir=$(git -C "$cwd" rev-parse --git-common-dir 2>/dev/null) || {
+    echo "Error: not inside a git repository" >&2
+    exit 1
+  }
+  if [[ "$common_dir" != /* ]]; then
+    common_dir="$(cd "$cwd" && cd "$common_dir" && pwd)"
+  fi
+  echo "$common_dir"
+}
+
+# Resolve repo root (bare repo dir, or parent of .git for regular repos)
+resolve_repo_root() {
+  local cwd="$1"
+  local common_dir is_bare
+  common_dir=$(resolve_common_dir "$cwd")
+  is_bare=$(git --git-dir="$common_dir" rev-parse --is-bare-repository 2>/dev/null || echo "false")
+  if [[ "$is_bare" == "true" ]]; then
+    echo "$common_dir"
+  else
+    echo "$(dirname "$common_dir")"
+  fi
+}
+
+# Resolve worktree target path from a name
+resolve_target() {
+  local name="$1"
+  local cwd="$2"
+  local common_dir is_bare
+
+  common_dir=$(resolve_common_dir "$cwd")
+  is_bare=$(git --git-dir="$common_dir" rev-parse --is-bare-repository 2>/dev/null || echo "false")
+
+  if [[ "$is_bare" == "true" ]]; then
+    # Bare repo: worktree is a sibling inside the bare repo dir
+    echo "$common_dir/$name"
+  else
+    # Regular repo: worktree is a sibling at the parent level
+    local repo_root
+    repo_root="$(dirname "$common_dir")"
+    echo "$(dirname "$repo_root")/$(basename "$repo_root")-$name"
+  fi
+}
+
+cmd_new() {
+  local OPEN_CURSOR=false
+  local OPEN_CODE=false
+  local NAME=""
+
+  for arg in "$@"; do
+    case "$arg" in
+      --cursor) OPEN_CURSOR=true ;;
+      --code)   OPEN_CODE=true ;;
+      --help|-h) usage ;;
+      -*) echo "Unknown option: $arg"; usage ;;
+      *) NAME="$arg" ;;
+    esac
+  done
+
+  [[ -z "$NAME" ]] && usage
+
+  local CWD TARGET
+  CWD=$(pwd)
+  TARGET=$(resolve_target "$NAME" "$CWD")
+
+  if [[ -d "$TARGET" ]]; then
+    echo "→ Worktree already exists: $TARGET" >&2
+  else
+    mkdir -p "$(dirname "$TARGET")"
+    echo "→ Creating worktree: $TARGET" >&2
+    # New branch preferred; fall back to existing branch with same name
+    if ! git -C "$CWD" worktree add "$TARGET" -b "$NAME" >/dev/null 2>&1; then
+      git -C "$CWD" worktree add "$TARGET" "$NAME" 1>&2
+    fi
+    echo "→ Created: $TARGET" >&2
+  fi
+
+  [[ "$OPEN_CURSOR" == "true" ]] && cursor "$TARGET"
+  [[ "$OPEN_CODE"   == "true" ]] && code   "$TARGET"
+
+  # stdout: directive consumed by the wt shell wrapper
+  echo "cd+init:$TARGET"
+}
+
+cmd_ls() {
+  local cwd current
+  cwd=$(pwd)
+  current=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || echo "")
+
+  # Print each worktree: * for current, ~ instead of $HOME, branch in brackets, no hash
+  git -C "$cwd" worktree list --porcelain | awk -v home="$HOME" -v current="$current" '
+    /^worktree / { path=$2; branch="" }
+    /^branch /   { branch=$2; sub("refs/heads/", "", branch) }
+    /^bare/      { path=""; branch="" }
+    /^$/ {
+      if (path != "") {
+        display = path
+        sub(home, "~", display)
+        marker = (path == current) ? "*" : " "
+        if (branch != "")
+          printf "%s %s [%s]\n", marker, display, branch
+        else
+          printf "%s %s\n", marker, display
+        path=""; branch=""
+      }
+    }
+  '
+}
+
+cmd_cd() {
+  local NAME="${1:-}"
+  [[ -z "$NAME" ]] && { echo "Usage: wt cd <name>"; exit 1; }
+
+  local CWD TARGET
+  CWD=$(pwd)
+  TARGET=$(resolve_target "$NAME" "$CWD")
+
+  if [[ ! -d "$TARGET" ]]; then
+    echo "Error: worktree not found: $TARGET" >&2
+    exit 1
+  fi
+
+  # stdout: directive consumed by the wt shell wrapper
+  echo "cd:$TARGET"
+}
+
+cmd_remove() {
+  local CWD TARGET
+  CWD=$(pwd)
+
+  if [[ -z "${1:-}" ]]; then
+    # No arg: remove current worktree
+    TARGET=$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null) || {
+      echo "Error: not inside a worktree" >&2
+      exit 1
+    }
+  else
+    TARGET=$(resolve_target "$1" "$CWD")
+  fi
+
+  if [[ ! -d "$TARGET" ]]; then
+    echo "Error: worktree not found: $TARGET" >&2
+    exit 1
+  fi
+
+  # Determine where to cd after removal
+  local COMMON_DIR IS_BARE DEST
+  COMMON_DIR=$(resolve_common_dir "$CWD")
+  IS_BARE=$(git --git-dir="$COMMON_DIR" rev-parse --is-bare-repository 2>/dev/null || echo "false")
+
+  if [[ "$IS_BARE" == "true" ]]; then
+    # Bare repo: cd to default branch worktree, not the bare root
+    local DEFAULT_BRANCH
+    DEFAULT_BRANCH=$(git --git-dir="$COMMON_DIR" symbolic-ref --short HEAD 2>/dev/null || echo "main")
+    DEST="$COMMON_DIR/$DEFAULT_BRANCH"
+    # If the default worktree is the one being removed, find another
+    if [[ ! -d "$DEST" || "$DEST" == "$TARGET" ]]; then
+      DEST=$(git --git-dir="$COMMON_DIR" worktree list --porcelain \
+        | awk '/^worktree / {print $2}' \
+        | grep -v "^$TARGET$" | grep -v "^$COMMON_DIR$" | head -1)
+      [[ -z "$DEST" ]] && DEST="$COMMON_DIR"
+    fi
+  else
+    # Regular repo: cd to the working copy root
+    DEST=$(dirname "$COMMON_DIR")
+  fi
+
+  echo "→ Removing worktree: $TARGET" >&2
+  git -C "$CWD" worktree remove --force "$TARGET" 1>&2
+  rm -rf "$TARGET"
+  rmdir "$(dirname "$TARGET")" 2>/dev/null || true
+  echo "→ Removed: $TARGET" >&2
+
+  # stdout: directive consumed by the wt shell wrapper
+  echo "rm:$TARGET:$DEST"
+}
+
+cmd_clone() {
+  local URL="${1:-}"
+  [[ -z "$URL" ]] && { echo "Usage: wt clone <url> [name]"; exit 1; }
+
+  # Derive repo name from URL if not provided
+  local NAME="${2:-}"
+  if [[ -z "$NAME" ]]; then
+    NAME=$(basename "$URL" .git)
+  fi
+
+  local BARE_DIR
+  BARE_DIR="$(pwd)/$NAME"
+
+  if [[ -d "$BARE_DIR" ]]; then
+    echo "Error: directory already exists: $BARE_DIR" >&2
+    exit 1
+  fi
+
+  echo "→ Cloning $URL → $BARE_DIR" >&2
+  git clone --bare --ref-format=reftable "$URL" "$BARE_DIR" 1>&2
+
+  # Detect default branch
+  local DEFAULT_BRANCH
+  DEFAULT_BRANCH=$(git -C "$BARE_DIR" symbolic-ref --short HEAD 2>/dev/null || echo "main")
+
+  # Create initial worktree for the default branch
+  local WORKTREE="$BARE_DIR/$DEFAULT_BRANCH"
+  echo "→ Creating worktree: $WORKTREE" >&2
+  git -C "$BARE_DIR" worktree add "$WORKTREE" "$DEFAULT_BRANCH" 1>&2
+  git -C "$WORKTREE" branch --set-upstream-to="origin/$DEFAULT_BRANCH" "$DEFAULT_BRANCH" 1>&2
+  echo "→ Done: $WORKTREE" >&2
+
+  # stdout: directive consumed by the wt shell wrapper
+  echo "cd+init:$WORKTREE"
+}
+
+cmd_pr() {
+  local URL="${1:-}"
+  [[ -z "$URL" ]] && { echo "Usage: wt pr <github-pr-url>"; exit 1; }
+
+  # Parse GitHub PR URL: https://github.com/ORG/REPO/pull/NUMBER
+  local ORG REPO PR_NUMBER
+  if [[ "$URL" =~ github\.com/([^/]+)/([^/]+)/pull/([0-9]+) ]]; then
+    ORG="${BASH_REMATCH[1]}"
+    REPO="${BASH_REMATCH[2]}"
+    PR_NUMBER="${BASH_REMATCH[3]}"
+  else
+    echo "Error: invalid GitHub PR URL: $URL" >&2
+    exit 1
+  fi
+
+  # Find local repo by matching remote URL against ~/Projects dirs
+  local REPO_DIR=""
+  echo "→ Searching ~/Projects for $ORG/$REPO..." >&2
+  for dir in "$HOME/Projects"/*/; do
+    [[ -d "$dir" ]] || continue
+    local remote
+    remote=$(git -C "$dir" remote get-url origin 2>/dev/null || true)
+    if echo "$remote" | grep -q "$ORG/$REPO"; then
+      REPO_DIR="${dir%/}"
+      break
+    fi
+  done
+
+  # If not found locally, auto-clone using gh to get the SSH URL
+  if [[ -z "$REPO_DIR" ]]; then
+    echo "→ Not found — resolving SSH URL via gh..." >&2
+    local CLONE_URL
+    CLONE_URL=$(gh repo view "$ORG/$REPO" --json sshUrl -q '.sshUrl' 2>/dev/null) || {
+      echo "Error: could not resolve $ORG/$REPO via gh. Is gh authenticated?" >&2
+      exit 1
+    }
+    local BARE_DIR="$HOME/Projects/$REPO"
+    echo "→ Cloning $CLONE_URL → $BARE_DIR" >&2
+    git clone --bare --ref-format=reftable "$CLONE_URL" "$BARE_DIR" 1>&2
+    local DEFAULT_BRANCH
+    DEFAULT_BRANCH=$(git -C "$BARE_DIR" symbolic-ref --short HEAD 2>/dev/null || echo "main")
+    local INITIAL_WORKTREE="$BARE_DIR/$DEFAULT_BRANCH"
+    echo "→ Creating initial worktree: $INITIAL_WORKTREE" >&2
+    git -C "$BARE_DIR" worktree add "$INITIAL_WORKTREE" "$DEFAULT_BRANCH" 1>&2
+    git -C "$INITIAL_WORKTREE" branch --set-upstream-to="origin/$DEFAULT_BRANCH" "$DEFAULT_BRANCH" 1>&2
+    REPO_DIR="$BARE_DIR"
+  else
+    echo "→ Found: $REPO_DIR" >&2
+  fi
+
+  # Create a detached worktree named pr-<number>
+  # review-pr uses `gh pr checkout` to set up the branch — no local branch needed here
+  local NAME="pr-$PR_NUMBER"
+  local TARGET
+  TARGET=$(resolve_target "$NAME" "$REPO_DIR")
+
+  if [[ -d "$TARGET" ]]; then
+    echo "→ Reusing existing worktree: $TARGET" >&2
+  else
+    mkdir -p "$(dirname "$TARGET")"
+    echo "→ Fetching origin..." >&2
+    git -C "$REPO_DIR" fetch origin 1>&2
+    echo "→ Creating detached worktree: $TARGET" >&2
+    git -C "$REPO_DIR" worktree add --detach "$TARGET" 1>&2
+    echo "→ Done: $TARGET" >&2
+  fi
+
+  # Use | as separator since URLs contain colons
+  # stdout: directive consumed by the wt shell wrapper (pr: → no init)
+  echo "pr:$TARGET|$URL"
+}
+
+cmd_migrate() {
+  local CWD COMMON_DIR IS_BARE
+  CWD=$(pwd)
+  COMMON_DIR=$(resolve_common_dir "$CWD")
+  IS_BARE=$(git --git-dir="$COMMON_DIR" rev-parse --is-bare-repository 2>/dev/null || echo "false")
+
+  if [[ "$IS_BARE" == "true" ]]; then
+    echo "Error: already a bare repo" >&2
+    exit 1
+  fi
+
+  local REPO_ROOT NAME PARENT BAK BARE_TMP DEFAULT_BRANCH WORKTREE
+  REPO_ROOT="$(dirname "$COMMON_DIR")"
+  NAME=$(basename "$REPO_ROOT")
+  PARENT=$(dirname "$REPO_ROOT")
+  BAK="$REPO_ROOT-bak"
+  BARE_TMP="$PARENT/$NAME-bare-tmp"
+
+  # Capture sibling worktrees (path:branch) before migration
+  local SIBLINGS
+  SIBLINGS=$(git -C "$REPO_ROOT" worktree list --porcelain | awk -v main="$REPO_ROOT" '
+    /^worktree / { path=$2; branch="" }
+    /^branch /   { branch=$2; sub("refs/heads/", "", branch) }
+    /^$/ && path != main && branch != "" { print path ":" branch }
+  ')
+
+  # Capture remote URLs before migration
+  local REMOTE_URL
+  REMOTE_URL=$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || true)
+
+  echo "→ Cloning bare repo to $BARE_TMP..." >&2
+  git clone --bare --ref-format=reftable "$REPO_ROOT/.git" "$BARE_TMP" 1>&2
+  echo "→ Replacing $REPO_ROOT with bare clone..." >&2
+  mv "$REPO_ROOT" "$BAK"
+  mv "$BARE_TMP" "$REPO_ROOT"
+
+  # Fix remote: bare clone points to local path, not the original upstream
+  if [[ -n "$REMOTE_URL" ]]; then
+    echo "→ Restoring remote origin → $REMOTE_URL" >&2
+    git -C "$REPO_ROOT" remote set-url origin "$REMOTE_URL"
+    git -C "$REPO_ROOT" config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
+    echo "→ Fetching from origin..." >&2
+    git -C "$REPO_ROOT" fetch 1>&2
+  fi
+
+  # Create main worktree
+  DEFAULT_BRANCH=$(git -C "$REPO_ROOT" symbolic-ref --short HEAD 2>/dev/null || echo "main")
+  WORKTREE="$REPO_ROOT/$DEFAULT_BRANCH"
+  echo "→ Creating main worktree: $WORKTREE" >&2
+  git -C "$REPO_ROOT" worktree add "$WORKTREE" "$DEFAULT_BRANCH" 1>&2
+  git -C "$WORKTREE" branch --set-upstream-to="origin/$DEFAULT_BRANCH" "$DEFAULT_BRANCH" 1>&2
+
+  # Move sibling worktrees inside the bare repo and re-register them
+  if [[ -n "$SIBLINGS" ]]; then
+    while IFS=: read -r OLD_PATH BRANCH; do
+      [[ -z "$OLD_PATH" ]] && continue
+      local SAFE_BRANCH NEW_PATH
+      SAFE_BRANCH="${BRANCH//\//-}"
+      NEW_PATH="$REPO_ROOT/$SAFE_BRANCH"
+      echo "Moving worktree: $OLD_PATH → $NEW_PATH" >&2
+      mv "$OLD_PATH" "$NEW_PATH"
+      git -C "$REPO_ROOT" worktree repair "$NEW_PATH" >&2
+    done <<< "$SIBLINGS"
+  fi
+
+  echo "→ Done. Verify '$WORKTREE' works, then remove the backup:" >&2
+  echo "   rm -rf '$BAK'" >&2
+
+  # stdout: directive consumed by the wt shell wrapper
+  echo "cd+init:$WORKTREE"
+}
+
+# Dispatch
+case "${1:-}" in
+  new)     shift; cmd_new "$@" ;;
+  rm)      shift; cmd_remove "$@" ;;
+  cd)      shift; cmd_cd "$@" ;;
+  ls)      cmd_ls ;;
+  clone)   shift; cmd_clone "$@" ;;
+  migrate) cmd_migrate ;;
+  pr)      shift; cmd_pr "$@" ;;
+  --help|-h) usage ;;
+  "")      cmd_ls; echo; echo "Run 'wt --help' for usage." ;;
+  *)       echo "Unknown command: ${1}. Run 'wt --help' for usage." >&2; exit 1 ;;
+esac
