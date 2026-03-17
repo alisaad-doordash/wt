@@ -57,8 +57,10 @@ _wt_handle_directive() {
 }
 
 wt() {
-  # Pass-through: no shell post-processing needed
-  if [[ "${1:-}" == "ls" || "${1:-}" == "" ]]; then
+  # Pass-through for commands that write their real output to stdout.
+  # These can't go through the directive-capture path (`directive=$(command wt "$@")`)
+  # because that swallows stdout — the user would see nothing.
+  if [[ "${1:-}" == "ls" || "${1:-}" == "" || "${1:-}" == "branches" ]]; then
     command wt "$@"
     return
   fi
