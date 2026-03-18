@@ -138,7 +138,14 @@ _do_delete_branches() {
     if [[ -n "$upstream" ]]; then
       local remote="${upstream%%/*}"
       local remote_branch="${upstream#*/}"
-      git --git-dir="$COMMON_DIR" push "$remote" --delete "$remote_branch" 1>&2 || true
+      local push_out
+      push_out=$(git --git-dir="$COMMON_DIR" push "$remote" --delete "$remote_branch" 2>&1) || {
+        if [[ "$push_out" == *"remote ref does not exist"* ]]; then
+          printf "  ${C_DIM}(remote branch already deleted)${C_RESET}\n" >&2
+        else
+          printf '%s\n' "$push_out" >&2
+        fi
+      }
     fi
   done
 }
