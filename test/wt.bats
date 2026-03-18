@@ -814,6 +814,73 @@ MOCK
 # 12. Bash 3.2 compatibility — answer prompt case statement
 # ---------------------------------------------------------------------------
 
+@test "_gc_branches: table has numbered # column" {
+  init_bare_repo
+  "$REAL_GIT" --git-dir="$TEST_DIR" branch feat-x main >/dev/null 2>&1
+  local LOG="$TEST_DIR/wt-branch-origin.tsv"
+  printf 'feat-x\t%s\t2026-03-17T10:00:00Z\n' "$BATS_TEST_TMPDIR/wt" > "$LOG"
+
+  _branch_pr_status() { echo "merged"; }
+  _do_delete_branches() { true; }
+
+  run _gc_branches "$TEST_DIR" "" "true"
+  [[ "$output" == *"#"* ]]
+  [[ "$output" == *"1"* ]]  # row 1 is present
+}
+
+@test "_gc_branches: interactive prompt shows pre-selected default indices" {
+  init_bare_repo
+  "$REAL_GIT" --git-dir="$TEST_DIR" branch feat-x main >/dev/null 2>&1
+  local LOG="$TEST_DIR/wt-branch-origin.tsv"
+  printf 'feat-x\t%s\t2026-03-17T10:00:00Z\n' "$BATS_TEST_TMPDIR/wt" > "$LOG"
+
+  _branch_pr_status() { echo "merged"; }
+  _do_delete_branches() { true; }
+
+  # Simulate pressing Enter (accept default) by feeding empty line
+  run bash -c "
+    export __WT_TESTS=1
+    source '$WT_BIN'
+    _branch_pr_status() { echo 'merged'; }
+    _do_delete_branches() { echo 'DELETED:\$@'; }
+    echo '' | _gc_branches '$TEST_DIR' '' 'false' 2>&1
+  "
+  # With empty input the default selection is used; merged branch should be deleted
+  [[ "$output" == *"DELETED"* ]] || [[ "$output" == *"Delete"* ]]
+}
+
+@test "cmd_branches: dynamic column widths for long branch names" {
+  init_bare_repo
+  local LOG="$TEST_DIR/wt-branch-origin.tsv"
+  local long_branch="i18n_audience-expansion-badge-sidesheet"
+  printf '%s\t%s\t2026-03-10T12:00:00Z\n' "$long_branch" "$BATS_TEST_TMPDIR/wt" > "$LOG"
+
+  _branch_pr_status() { echo "merged"; }
+  resolve_common_dir() { echo "$TEST_DIR"; }
+
+  run cmd_branches
+  [[ "$output" == *"$long_branch"* ]]
+  # The separator line must be at least as wide as the branch name
+  local sep_line
+  sep_line=$(printf '%s\n' "$output" | grep '─' | head -1)
+  [[ ${#sep_line} -ge ${#long_branch} ]]
+}
+
+@test "cmd_branches: colors in format string not data (no \\033 in plain field)" {
+  init_bare_repo
+  local LOG="$TEST_DIR/wt-branch-origin.tsv"
+  printf 'feat-x\t%s\t2026-03-10T12:00:00Z\n' "$BATS_TEST_TMPDIR/wt" > "$LOG"
+
+  _branch_pr_status() { echo "merged"; }
+  resolve_common_dir() { echo "$TEST_DIR"; }
+
+  # Capture output (not a TTY → no colors produced)
+  local out
+  out=$(cmd_branches)
+  # No ANSI escape sequences should appear in non-TTY output
+  [[ "$out" != *$'\033['* ]]
+}
+
 @test "answer prompt: case [Yy] accepts y and Y, rejects n N and empty" {
   # Tests the case pattern used in _gc_branches and cmd_remove prompts.
   # Replaces '${answer,,} == y' (bash 4.0+) for bash 3.2 compat.

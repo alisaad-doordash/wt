@@ -11,6 +11,12 @@ else
   C_RED=''; C_GREEN=''; C_YELLOW=''; C_CYAN=''
 fi
 
+# Generate N '─' characters on stdout — shared by all table renderers.
+_sep() {
+  local n="$1" i
+  for ((i=0; i<n; i++)); do printf '─'; done
+}
+
 usage() {
   # Write to stderr so stdout stays clean for the shell wrapper's directive capture.
   # Exit code is parameterised: 0 for --help (success), 1 for unknown command (error).
@@ -151,231 +157,200 @@ _do_delete_branches() {
 }
 
 # _gc_branches COMMON_DIR [WORKTREE_FILTER] [SKIP_PROMPTS]
-# Collects stale branches, displays table, prompts for deletion.
+# Collects stale branches, displays a numbered table, and presents an
+# interactive selection prompt so the user can pick exactly which to delete.
 _gc_branches() {
   local COMMON_DIR="$1"
   local WORKTREE_FILTER="${2:-}"
   local SKIP_PROMPTS="${3:-false}"
   local LOG="$COMMON_DIR/wt-branch-origin.tsv"
 
-  # Collect active worktree paths and branches
   local ACTIVE_WTS ACTIVE_BRANCHES
   ACTIVE_WTS=$(git --git-dir="$COMMON_DIR" worktree list --porcelain \
     | awk '/^worktree / {print $2}')
   ACTIVE_BRANCHES=$(git --git-dir="$COMMON_DIR" worktree list --porcelain \
     | awk '/^branch / {b=$2; sub("refs/heads/","",b); print b}')
 
-  # Grouping strategy: we want branches displayed under their originating worktree.
-  # We can't use declare -A (associative arrays) because macOS ships bash 3.2 and
-  # bats runs tests under it. Instead: one temp file per worktree (named by numeric
-  # index), with wt_order[] as the ordered list of worktrees seen so far.
+  # Grouping: one temp file per originating worktree (bash 3.2, no assoc arrays).
   local _gc_tmpdir
   _gc_tmpdir=$(mktemp -d)
   # shellcheck disable=SC2064
   trap "rm -rf '$_gc_tmpdir'" RETURN
 
   declare -a wt_order=()
-  declare -a delete_queue=()
-  local _gc_n=0  # count of unique worktrees seen
+  declare -a delete_queue=()  # pre-selected for deletion (merged + local-only when filtered)
+  local _gc_n=0
+  # Column widths — tracked inline during collection; no separate scan pass.
+  local col_branch=6 col_pr=2  # minimums = header text lengths
 
-  # Find or create a numeric index for a worktree path; sets _gc_idx.
-  # Linear scan is fine — the number of worktrees per repo is tiny.
   _gc_wt_index() {
-    local _wt="$1"
-    local _i
+    local _wt="$1" _i
     for ((_i=0; _i<_gc_n; _i++)); do
       [[ "${wt_order[$_i]}" == "$_wt" ]] && { _gc_idx=$_i; return; }
     done
-    wt_order[_gc_n]="$_wt"
-    _gc_idx=$_gc_n
-    _gc_n=$((_gc_n + 1))
+    wt_order[_gc_n]="$_wt"; _gc_idx=$_gc_n; _gc_n=$((_gc_n + 1))
   }
 
+  # ── Data collection ──────────────────────────────────────────────────────────
   if [[ -n "$WORKTREE_FILTER" ]]; then
     if [[ ! -f "$LOG" ]]; then
       echo "No tracked branches for this worktree (run 'wt setup' to enable tracking)." >&2
       return 0
     fi
-    # Filter to branches from the specified worktree
     while IFS=$'\t' read -r branch worktree ts; do
       [[ "$worktree" != "$WORKTREE_FILTER" ]] && continue
-      # Skip branches still active in a worktree
-      if printf '%s\n' "$ACTIVE_BRANCHES" | grep -Fqx "$branch" 2>/dev/null; then
-        continue
-      fi
+      printf '%s\n' "$ACTIVE_BRANCHES" | grep -Fqx "$branch" 2>/dev/null && continue
       local status_raw="" pr_info="" status_label=""
       status_raw=$(_branch_pr_status "$COMMON_DIR" "$branch")
       case "$status_raw" in
-        merged)
-          status_label="merged"
-          delete_queue+=("$branch")
-          ;;
+        merged)     status_label="merged";     delete_queue+=("$branch") ;;
+        local-only) status_label="local-only"; delete_queue+=("$branch") ;;
         open:*)
           local pr_num="${status_raw#open:}" pr_title=""
-          pr_title="${pr_num#*:}"
-          pr_num="${pr_num%%:*}"
-          status_label="open"
-          pr_info="#$pr_num \"$pr_title\""
+          pr_title="${pr_num#*:}"; pr_num="${pr_num%%:*}"
+          status_label="open"; pr_info="#$pr_num \"$pr_title\""
           ;;
-        local-only)
-          status_label="local-only"
-          # When cleaning up a specific removed worktree, local-only branches
-          # are also orphaned — queue them alongside merged ones.
-          delete_queue+=("$branch")
-          ;;
-        *)
-          status_label="none"
-          ;;
+        *) status_label="none" ;;
       esac
-      local _gc_idx=0
-      _gc_wt_index "$worktree"
+      [[ ${#branch}  -gt $col_branch ]] && col_branch=${#branch}
+      [[ ${#pr_info} -gt $col_pr     ]] && col_pr=${#pr_info}
+      local _gc_idx=0; _gc_wt_index "$worktree"
       printf '%s\t%s\t%s\n' "$branch" "$status_label" "$pr_info" >> "$_gc_tmpdir/$_gc_idx"
     done < "$LOG"
   else
-    # Scan all local branches not in any active worktree
     local all_local_branches
     all_local_branches=$(git --git-dir="$COMMON_DIR" for-each-ref \
       --format='%(refname:short)' 'refs/heads/' 2>/dev/null || true)
     while IFS= read -r branch; do
       [[ -z "$branch" ]] && continue
-      # Skip branches in active worktrees
-      if printf '%s\n' "$ACTIVE_BRANCHES" | grep -Fqx "$branch" 2>/dev/null; then
-        continue
-      fi
-      # Find originating worktree from log
+      printf '%s\n' "$ACTIVE_BRANCHES" | grep -Fqx "$branch" 2>/dev/null && continue
       local origin_wt="unknown"
       if [[ -f "$LOG" ]]; then
         local found_wt
         found_wt=$(awk -F'\t' -v b="$branch" '$1==b {print $2; exit}' "$LOG" || true)
         [[ -n "$found_wt" ]] && origin_wt="$found_wt"
       fi
-
       local status_raw="" pr_info="" status_label=""
       status_raw=$(_branch_pr_status "$COMMON_DIR" "$branch")
       case "$status_raw" in
-        merged)
-          status_label="merged"
-          delete_queue+=("$branch")
-          ;;
+        merged)     status_label="merged"; delete_queue+=("$branch") ;;
+        local-only) status_label="local-only" ;;
         open:*)
           local pr_num="${status_raw#open:}" pr_title=""
-          pr_title="${pr_num#*:}"
-          pr_num="${pr_num%%:*}"
-          status_label="open"
-          pr_info="#$pr_num \"$pr_title\""
+          pr_title="${pr_num#*:}"; pr_num="${pr_num%%:*}"
+          status_label="open"; pr_info="#$pr_num \"$pr_title\""
           ;;
-        local-only)
-          status_label="local-only"
-          ;;
-        *)
-          status_label="none"
-          ;;
+        *) status_label="none" ;;
       esac
-      local _gc_idx=0
-      _gc_wt_index "$origin_wt"
+      [[ ${#branch}  -gt $col_branch ]] && col_branch=${#branch}
+      [[ ${#pr_info} -gt $col_pr     ]] && col_pr=${#pr_info}
+      local _gc_idx=0; _gc_wt_index "$origin_wt"
       printf '%s\t%s\t%s\n' "$branch" "$status_label" "$pr_info" >> "$_gc_tmpdir/$_gc_idx"
     done <<< "$all_local_branches"
   fi
 
   if [[ $_gc_n -eq 0 ]]; then
-    echo "Nothing to delete." >&2
-    return 0
+    echo "Nothing to delete." >&2; return 0
   fi
 
-  # Two-pass: scan temp files to find max column widths, then render.
-  # Status is bounded ("local-only" = 10 chars); only BRANCH and PR vary.
-  local col_branch=6  # min = len("BRANCH")
-  local col_pr=2      # min = len("PR")
-  local _j
-  for ((_j=0; _j<_gc_n; _j++)); do
-    [[ -f "$_gc_tmpdir/$_j" ]] || continue
-    while IFS=$'\t' read -r _b _s _p; do
-      [[ -z "$_b" ]] && continue
-      [[ ${#_b} -gt $col_branch ]] && col_branch=${#_b}
-      [[ ${#_p} -gt $col_pr ]]     && col_pr=${#_p}
-    done < "$_gc_tmpdir/$_j"
-  done
-  # Cap PR at 50 chars; very long titles are truncated with '…' when printing.
   [[ $col_pr -gt 50 ]] && col_pr=50
+  local sep_branch sep_pr
+  sep_branch=$(_sep $col_branch); sep_pr=$(_sep $col_pr)
 
-  # Build separator strings — one '─' per column character.
-  local sep_branch="" sep_pr="" _k
-  for ((_k=0; _k<col_branch; _k++)); do sep_branch+='─'; done
-  for ((_k=0; _k<col_pr;     _k++)); do sep_pr+='─'; done
-
-  # Display table grouped by originating worktree
+  # ── Render numbered table ────────────────────────────────────────────────────
+  # Row numbers are assigned here (display order); stored in _display_branches[]
+  # so the interactive prompt can map "3" → branch name.
+  declare -a _display_branches=()
+  local _row_n=0
   local _i
   for ((_i=0; _i<_gc_n; _i++)); do
     local wt="${wt_order[$_i]}"
-
     if [[ "$wt" == "unknown" ]]; then
-      # Branches that predate 'wt setup' have no log entry; show a neutral header.
       printf "${C_BOLD}WORKTREE${C_RESET}  ${C_DIM}(origin not tracked)${C_RESET}\n\n" >&2
     else
       local display_wt="${wt/#$HOME/~}"
       local wt_context="removed" ctx_color="$C_DIM"
-      if printf '%s\n' "$ACTIVE_WTS" | grep -Fqx "$wt" 2>/dev/null; then
-        wt_context="active"; ctx_color="$C_CYAN"
-      fi
+      printf '%s\n' "$ACTIVE_WTS" | grep -Fqx "$wt" 2>/dev/null \
+        && { wt_context="active"; ctx_color="$C_CYAN"; }
       printf "${C_BOLD}WORKTREE${C_RESET}  ${C_BOLD}%s${C_RESET}  ${ctx_color}[%s]${C_RESET}\n\n" \
         "$display_wt" "$wt_context" >&2
     fi
-    printf "  %-*s  %-10s  %-*s  %s\n" \
-      "$col_branch" "BRANCH" "STATUS" "$col_pr" "PR" "ACTION" >&2
-    printf "  %-*s  %-10s  %-*s  %s\n" \
-      "$col_branch" "$sep_branch" "──────────" "$col_pr" "$sep_pr" "────────────" >&2
+    printf "  %-3s  %-*s  %-10s  %-*s  %s\n" \
+      "#" "$col_branch" "BRANCH" "STATUS" "$col_pr" "PR" "ACTION" >&2
+    printf "  %-3s  %-*s  %-10s  %-*s  %s\n" \
+      "───" "$col_branch" "$sep_branch" "──────────" "$col_pr" "$sep_pr" "────────────" >&2
 
     [[ -f "$_gc_tmpdir/$_i" ]] && while IFS=$'\t' read -r branch status_label pr_info; do
       [[ -z "$branch" ]] && continue
+      _row_n=$((_row_n + 1))
+      _display_branches[$_row_n]="$branch"
       local action="" action_color="" status_color=""
       case "$status_label" in
         merged)
-          status_color="$C_GREEN"; action="will delete"; action_color="$C_RED"
-          ;;
+          status_color="$C_GREEN"; action="will delete"; action_color="$C_RED" ;;
         open)
-          status_color="$C_YELLOW"
-          ;;
+          status_color="$C_YELLOW" ;;
         local-only)
           status_color="$C_DIM"
-          # Filtered mode (post-wt-rm): local-only is queued, so show the action.
-          [[ -n "$WORKTREE_FILTER" ]] && { action="will delete"; action_color="$C_RED"; }
-          ;;
+          [[ -n "$WORKTREE_FILTER" ]] && { action="will delete"; action_color="$C_RED"; } ;;
         none)
-          status_color="$C_DIM"
-          ;;
+          status_color="$C_DIM" ;;
       esac
       local pr_display="$pr_info"
       [[ ${#pr_info} -gt $col_pr ]] && pr_display="${pr_info:0:$((col_pr-1))}…"
-      printf "  %-*s  ${status_color}%-10s${C_RESET}  %-*s  ${action_color}%s${C_RESET}\n" \
-        "$col_branch" "$branch" "$status_label" "$col_pr" "$pr_display" "$action" >&2
+      printf "  %-3s  %-*s  ${status_color}%-10s${C_RESET}  %-*s  ${action_color}%s${C_RESET}\n" \
+        "$_row_n" "$col_branch" "$branch" "$status_label" "$col_pr" "$pr_display" "$action" >&2
     done < "$_gc_tmpdir/$_i"
-
     echo "" >&2
   done
 
-  local delete_count=${#delete_queue[@]}
-  if [[ "$delete_count" -eq 0 ]]; then
-    echo "Nothing to delete." >&2
-    return 0
+  if [[ "${#delete_queue[@]}" -eq 0 ]]; then
+    echo "Nothing to delete." >&2; return 0
   fi
 
+  # ── Prompt ───────────────────────────────────────────────────────────────────
   if [[ "$SKIP_PROMPTS" == "true" ]]; then
-    _do_delete_branches "$COMMON_DIR" "${delete_queue[@]}"
+    _do_delete_branches "$COMMON_DIR" "${delete_queue[@]}"; return
+  fi
+
+  # Build the default selection: row numbers of pre-queued branches.
+  local default_sel="" _k
+  for ((_k=1; _k<=_row_n; _k++)); do
+    local _b="${_display_branches[$_k]}"
+    for _q in "${delete_queue[@]}"; do
+      if [[ "$_q" == "$_b" ]]; then default_sel+="$_k "; break; fi
+    done
+  done
+  default_sel="${default_sel% }"  # trim trailing space
+
+  printf "${C_YELLOW}Delete [%s]${C_RESET}  (enter list, 'all', or q to skip): " \
+    "$default_sel" >&2
+  local sel
+  read -r sel </dev/tty
+
+  case "$sel" in
+    q|Q) echo "Skipped." >&2; return 0 ;;
+    "")  sel="$default_sel" ;;
+    all)
+      sel=""
+      for ((_k=1; _k<=_row_n; _k++)); do sel+="$_k "; done
+      sel="${sel% }"
+      ;;
+  esac
+
+  local final_queue=()
+  for num in $sel; do
+    local idx
+    idx=$(printf '%d' "$num" 2>/dev/null) || continue
+    if [[ $idx -ge 1 && $idx -le $_row_n ]]; then
+      final_queue+=("${_display_branches[$idx]}")
+    fi
+  done
+
+  if [[ "${#final_queue[@]}" -gt 0 ]]; then
+    _do_delete_branches "$COMMON_DIR" "${final_queue[@]}"
   else
-    printf "${C_YELLOW}%d branch(es) can be deleted. Delete? [y/N]${C_RESET} " \
-      "$delete_count" >&2
-    local answer
-    # Read from /dev/tty directly: stdout is captured by the shell wrapper
-    # (directive=$(command wt "$@")), so stdin may be a pipe, not the terminal.
-    read -r answer </dev/tty
-    case "$answer" in
-      [Yy])
-        _do_delete_branches "$COMMON_DIR" "${delete_queue[@]}"
-        ;;
-      *)
-        echo "Aborted." >&2
-        ;;
-    esac
+    echo "Nothing deleted." >&2
   fi
 }
 
@@ -574,6 +549,23 @@ cmd_remove() {
         ;;
     esac
 
+    # Also warn about other local-only branches tracked for this worktree in the
+    # log — a worktree accumulates multiple branches over its lifetime.
+    local LOG="$COMMON_DIR/wt-branch-origin.tsv"
+    if [[ -f "$LOG" ]]; then
+      while IFS=$'\t' read -r b wt _ts; do
+        [[ "$wt" != "$TARGET" ]] && continue
+        [[ "$b" == "$BRANCH" ]] && continue  # already handled above
+        # Only warn if the branch still exists and has no upstream
+        git --git-dir="$COMMON_DIR" rev-parse "refs/heads/$b" >/dev/null 2>&1 || continue
+        local _upstream
+        _upstream=$(git --git-dir="$COMMON_DIR" for-each-ref \
+          --format='%(upstream:short)' "refs/heads/$b" 2>/dev/null || true)
+        [[ -z "$_upstream" ]] && \
+          warnings+=("branch '$b' is also local-only (tracked in this worktree)")
+      done < "$LOG"
+    fi
+
     if [[ ${#warnings[@]} -gt 0 ]]; then
       printf "${C_BOLD}Warning: removing worktree with active branch:${C_RESET}\n" >&2
       for w in "${warnings[@]}"; do
@@ -649,9 +641,7 @@ cmd_branches() {
     exit 0
   fi
 
-  # cmd_branches writes to stdout (not stderr), so check fd 1 for TTY.
-  # The global C_* vars check fd 2; we need a separate set here so that
-  # piping `wt branches | ...` strips colors correctly.
+  # cmd_branches writes to stdout; check fd 1 for TTY so piping strips colors.
   local B="" D="" R="" GR="" YL="" CY=""
   if [[ -t 1 ]]; then
     B='\033[1m'; D='\033[2m'; R='\033[0m'
@@ -664,7 +654,7 @@ cmd_branches() {
   WORKTREE_PATHS=$(git --git-dir="$COMMON_DIR" worktree list --porcelain \
     | awk '/^worktree / {print $2}')
 
-  # Same bash 3.2 grouping pattern as _gc_branches: temp files + indexed arrays.
+  # Same bash 3.2 grouping: one temp file per worktree, indexed arrays.
   local _br_tmpdir
   _br_tmpdir=$(mktemp -d)
   # shellcheck disable=SC2064
@@ -672,69 +662,77 @@ cmd_branches() {
 
   declare -a wt_order=()
   local _br_n=0
+  # Column widths tracked inline during collection — no second scan pass.
+  local col_branch=6 col_pr=2  # minimums = header text lengths
 
-  # Find or create a numeric index for a worktree path; sets _br_idx.
   _br_wt_index() {
-    local _wt="$1"
-    local _i
+    local _wt="$1" _i
     for ((_i=0; _i<_br_n; _i++)); do
       [[ "${wt_order[$_i]}" == "$_wt" ]] && { _br_idx=$_i; return; }
     done
-    wt_order[_br_n]="$_wt"
-    _br_idx=$_br_n
-    _br_n=$((_br_n + 1))
+    wt_order[_br_n]="$_wt"; _br_idx=$_br_n; _br_n=$((_br_n + 1))
   }
 
+  # Collection pass: resolve status + PR info upfront so we know column widths
+  # before rendering. Status is stored as plain text; colors applied at render.
   while IFS=$'\t' read -r branch worktree ts; do
     local date_short="${ts%%T*}"
-    local _br_idx=0
-    _br_wt_index "$worktree"
-    printf '%s\t%s\n' "$branch" "$date_short" >> "$_br_tmpdir/$_br_idx"
+    local status_label="" pr_info=""
+    if printf '%s\n' "$WORKTREE_BRANCHES" | grep -Fqx "$branch" 2>/dev/null; then
+      status_label="active"
+    else
+      local raw
+      raw=$(_branch_pr_status "$COMMON_DIR" "$branch")
+      case "$raw" in
+        merged)     status_label="merged" ;;
+        local-only) status_label="local-only" ;;
+        open:*)
+          local pr_num="${raw#open:}" pr_title=""
+          pr_title="${pr_num#*:}"; pr_num="${pr_num%%:*}"
+          status_label="open"; pr_info="#$pr_num \"$pr_title\""
+          ;;
+        *) status_label="unknown" ;;
+      esac
+    fi
+    [[ ${#branch}  -gt $col_branch ]] && col_branch=${#branch}
+    [[ ${#pr_info} -gt $col_pr     ]] && col_pr=${#pr_info}
+    local _br_idx=0; _br_wt_index "$worktree"
+    printf '%s\t%s\t%s\t%s\n' "$branch" "$date_short" "$status_label" "$pr_info" \
+      >> "$_br_tmpdir/$_br_idx"
   done < "$LOG"
+
+  [[ $col_pr -gt 50 ]] && col_pr=50
+  local sep_branch sep_pr
+  sep_branch=$(_sep $col_branch); sep_pr=$(_sep $col_pr)
 
   local _i
   for ((_i=0; _i<_br_n; _i++)); do
     local wt="${wt_order[$_i]}"
     local display_wt="${wt/#$HOME/~}"
     local wt_context="removed" ctx_color="$D"
-    if printf '%s\n' "$WORKTREE_PATHS" | grep -Fqx "$wt" 2>/dev/null; then
-      wt_context="active"; ctx_color="$CY"
-    fi
+    printf '%s\n' "$WORKTREE_PATHS" | grep -Fqx "$wt" 2>/dev/null \
+      && { wt_context="active"; ctx_color="$CY"; }
 
     printf "${B}WORKTREE${R}  ${B}%s${R}  ${ctx_color}[%s]${R}\n\n" "$display_wt" "$wt_context"
-    printf "  %-20s  %-12s  %-12s  %s\n" "BRANCH" "DATE" "STATUS" "PR"
-    printf "  %-20s  %-12s  %-12s  %s\n" \
-      "──────────────────" "──────────" "──────────" "──────────────────────"
+    printf "  %-*s  %-10s  %-10s  %s\n" \
+      "$col_branch" "BRANCH" "DATE" "STATUS" "PR"
+    printf "  %-*s  %-10s  %-10s  %s\n" \
+      "$col_branch" "$sep_branch" "──────────" "──────────" "$sep_pr"
 
-    [[ -f "$_br_tmpdir/$_i" ]] && while IFS=$'\t' read -r branch date_short; do
+    [[ -f "$_br_tmpdir/$_i" ]] && while IFS=$'\t' read -r branch date_short status_label pr_info; do
       [[ -z "$branch" ]] && continue
-      local status_disp="" pr_info=""
-      if printf '%s\n' "$WORKTREE_BRANCHES" | grep -Fqx "$branch" 2>/dev/null; then
-        status_disp="${CY}active${R}"
-      else
-        local raw
-        raw=$(_branch_pr_status "$COMMON_DIR" "$branch")
-        case "$raw" in
-          merged)
-            status_disp="${GR}merged${R}"
-            ;;
-          open:*)
-            local pr_num="${raw#open:}" pr_title=""
-            pr_title="${pr_num#*:}"
-            pr_num="${pr_num%%:*}"
-            status_disp="${YL}open${R}"
-            pr_info="#$pr_num \"$pr_title\""
-            ;;
-          local-only)
-            status_disp="${D}local-only${R}"
-            pr_info="—"
-            ;;
-          *)
-            status_disp="${D}unknown${R}"
-            ;;
-        esac
-      fi
-      printf "  %-20s  %-12s  %-12b  %s\n" "$branch" "$date_short" "$status_disp" "$pr_info"
+      local status_color=""
+      case "$status_label" in
+        active)     status_color="$CY" ;;
+        merged)     status_color="$GR" ;;
+        open)       status_color="$YL" ;;
+        local-only) status_color="$D"  ;;
+        *)          status_color="$D"  ;;
+      esac
+      local pr_display="$pr_info"
+      [[ ${#pr_info} -gt $col_pr ]] && pr_display="${pr_info:0:$((col_pr-1))}…"
+      printf "  %-*s  %-10s  ${status_color}%-10s${R}  %s\n" \
+        "$col_branch" "$branch" "$date_short" "$status_label" "$pr_display"
     done < "$_br_tmpdir/$_i"
 
     echo ""
