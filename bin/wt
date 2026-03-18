@@ -558,6 +558,10 @@ cmd_remove() {
   rmdir "$(dirname "$TARGET")" 2>/dev/null || true
   echo "→ Removed: $TARGET" >&2
 
+  # cd away from the deleted directory before any further git operations;
+  # git calls getcwd() at startup and fatals if the process cwd is gone.
+  cd "$DEST" 2>/dev/null || cd "$HOME"
+
   # Post-removal gc: clean up branches from this worktree
   _gc_branches "$COMMON_DIR" "$TARGET" "$SKIP_PROMPTS"
 
