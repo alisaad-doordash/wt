@@ -113,7 +113,7 @@ _branch_pr_status() {
 
   local open_pr
   open_pr=$(gh pr list --repo "$gh_repo" --head "$branch" --state open \
-    --json number,title --jq '.[0] | "\(.number):\(.title)"' 2>/dev/null || true)
+    --json number,title --jq 'select(length > 0) | .[0] | "\(.number):\(.title)"' 2>/dev/null || true)
   if [[ -n "$open_pr" ]]; then echo "open:$open_pr" && return; fi
 
   echo "none"
@@ -324,11 +324,14 @@ _gc_branches() {
     # Read from /dev/tty directly: stdout is captured by the shell wrapper
     # (directive=$(command wt "$@")), so stdin may be a pipe, not the terminal.
     read -r answer </dev/tty
-    if [[ "${answer,,}" == "y" ]]; then
-      _do_delete_branches "$COMMON_DIR" "${delete_queue[@]}"
-    else
-      echo "Aborted." >&2
-    fi
+    case "$answer" in
+      [Yy])
+        _do_delete_branches "$COMMON_DIR" "${delete_queue[@]}"
+        ;;
+      *)
+        echo "Aborted." >&2
+        ;;
+    esac
   fi
 }
 
@@ -536,10 +539,13 @@ cmd_remove() {
       local answer
       # /dev/tty: same reason as in _gc_branches — stdin may be a pipe.
     read -r answer </dev/tty
-      if [[ "${answer,,}" != "y" ]]; then
-        echo "Aborted." >&2
-        exit 1
-      fi
+      case "$answer" in
+        [Yy]) ;;  # proceed with removal
+        *)
+          echo "Aborted." >&2
+          exit 1
+          ;;
+      esac
     fi
   fi
 

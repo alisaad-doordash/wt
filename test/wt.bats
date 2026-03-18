@@ -259,6 +259,22 @@ MOCK
   [[ "$output" == "none" ]]
 }
 
+@test "_branch_pr_status: jq filter produces no output for empty PR list" {
+  # Regression: old filter '.[0] | "\(.number):\(.title)"' on '[]' produces
+  # "null:null" (non-empty), which triggered a false open-PR warning on wt rm.
+  # The fix uses 'select(length > 0)' which produces empty output for [].
+  local result
+  result=$(printf '%s' '[]' | jq -r 'select(length > 0) | .[0] | "\(.number):\(.title)"')
+  [[ -z "$result" ]]
+}
+
+@test "_branch_pr_status: jq filter extracts number:title from non-empty list" {
+  local result
+  result=$(printf '%s' '[{"number":42,"title":"My PR"}]' \
+    | jq -r 'select(length > 0) | .[0] | "\(.number):\(.title)"')
+  [[ "$result" == "42:My PR" ]]
+}
+
 # ---------------------------------------------------------------------------
 # 4. post-checkout hook logic
 # ---------------------------------------------------------------------------
@@ -733,4 +749,30 @@ MOCK
   [[ -z "${C_BOLD:-}" ]] || [[ -z "${C_CYAN:-}" ]]
   # (In a non-TTY bats run, these are empty strings)
   true
+}
+
+# ---------------------------------------------------------------------------
+# 12. Bash 3.2 compatibility — answer prompt case statement
+# ---------------------------------------------------------------------------
+
+@test "answer prompt: case [Yy] accepts y and Y, rejects n N and empty" {
+  # Tests the case pattern used in _gc_branches and cmd_remove prompts.
+  # Replaces '${answer,,} == y' (bash 4.0+) for bash 3.2 compat.
+  local ans result
+
+  for ans in y Y; do
+    case "$ans" in
+      [Yy]) result="proceed" ;;
+      *)    result="abort"   ;;
+    esac
+    [[ "$result" == "proceed" ]] || { echo "expected proceed for '$ans'"; return 1; }
+  done
+
+  for ans in n N "" no; do
+    case "$ans" in
+      [Yy]) result="proceed" ;;
+      *)    result="abort"   ;;
+    esac
+    [[ "$result" == "abort" ]] || { echo "expected abort for '$ans'"; return 1; }
+  done
 }
