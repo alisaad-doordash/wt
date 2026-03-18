@@ -606,6 +606,41 @@ MOCK
   [[ "$branch_col_line" == *"BRANCH"* ]]
 }
 
+@test "_gc_branches: with WORKTREE_FILTER, local-only branches are queued for deletion" {
+  init_bare_repo
+  local LOG="$TEST_DIR/wt-branch-origin.tsv"
+  local WT1="$BATS_TEST_TMPDIR/wt-a"
+  # Two local-only branches from the same worktree
+  "$REAL_GIT" --git-dir="$TEST_DIR" branch local-a main >/dev/null 2>&1
+  "$REAL_GIT" --git-dir="$TEST_DIR" branch local-b main >/dev/null 2>&1
+  printf 'local-a\t%s\t2026-03-17T10:00:00Z\n' "$WT1" > "$LOG"
+  printf 'local-b\t%s\t2026-03-17T10:01:00Z\n' "$WT1" >> "$LOG"
+
+  _branch_pr_status() { echo "local-only"; }
+  _do_delete_branches() { true; }
+
+  run _gc_branches "$TEST_DIR" "$WT1" "false"
+  [[ "$status" -eq 0 ]]
+  # Both branches should appear and be marked for deletion
+  [[ "$output" == *"local-a"* ]]
+  [[ "$output" == *"local-b"* ]]
+  [[ "$output" == *"will delete"* ]]
+}
+
+@test "_gc_branches: without WORKTREE_FILTER, local-only branches are NOT queued" {
+  init_bare_repo
+  local LOG="$TEST_DIR/wt-branch-origin.tsv"
+  "$REAL_GIT" --git-dir="$TEST_DIR" branch local-a main >/dev/null 2>&1
+  printf 'local-a\tunknown\t2026-03-17T10:00:00Z\n' > "$LOG"
+
+  _branch_pr_status() { echo "local-only"; }
+
+  run _gc_branches "$TEST_DIR" "" "false"
+  [[ "$status" -eq 0 ]]
+  # local-only branch visible but not queued → "Nothing to delete." (no merged)
+  [[ "$output" == *"Nothing to delete."* ]]
+}
+
 @test "_gc_branches: WORKTREE_FILTER limits to branches from that wt" {
   init_bare_repo
   local LOG="$TEST_DIR/wt-branch-origin.tsv"

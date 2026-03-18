@@ -17,7 +17,7 @@ usage() {
   cat >&2 << 'EOF'
 Usage:
   wt new <name> [--cursor] [--code]   Create a worktree
-  wt rm [--yes] [name]                Remove a worktree (default: current)
+  wt rm [--yes] [--delete-branch] [name]  Remove a worktree (default: current)
   wt cd <name>                        cd into an existing worktree
   wt ls                               List all worktrees
   wt init [name]                      Run init script for a worktree (default: current)
@@ -219,6 +219,9 @@ _gc_branches() {
           ;;
         local-only)
           status_label="local-only"
+          # When cleaning up a specific removed worktree, local-only branches
+          # are also orphaned — queue them alongside merged ones.
+          delete_queue+=("$branch")
           ;;
         *)
           status_label="none"
@@ -332,7 +335,12 @@ _gc_branches() {
         open)
           status_color="$C_YELLOW"
           ;;
-        local-only | none)
+        local-only)
+          status_color="$C_DIM"
+          # Filtered mode (post-wt-rm): local-only is queued, so show the action.
+          [[ -n "$WORKTREE_FILTER" ]] && { action="will delete"; action_color="$C_RED"; }
+          ;;
+        none)
           status_color="$C_DIM"
           ;;
       esac
@@ -479,14 +487,15 @@ cmd_cd() {
 }
 
 cmd_remove() {
-  local CWD TARGET SKIP_PROMPTS=false
+  local CWD TARGET SKIP_PROMPTS=false DELETE_BRANCH=false
   CWD=$(pwd)
 
-  # Parse --yes/-y flag
+  # Parse --yes/-y and --delete-branch/-d flags
   local ARGS=()
   for arg in "$@"; do
     case "$arg" in
-      --yes|-y) SKIP_PROMPTS=true ;;
+      --yes|-y)           SKIP_PROMPTS=true ;;
+      --delete-branch|-d) DELETE_BRANCH=true ;;
       *) ARGS+=("$arg") ;;
     esac
   done
@@ -534,8 +543,10 @@ cmd_remove() {
   fi
 
   # Pre-removal warning check
-  local BRANCH=""
+  local BRANCH="" pr_status=""
   BRANCH=$(git -C "$TARGET" symbolic-ref --short HEAD 2>/dev/null || true)
+  # Fetch pr_status unconditionally — needed for post-removal branch cleanup too.
+  [[ -n "$BRANCH" ]] && pr_status=$(_branch_pr_status "$COMMON_DIR" "$BRANCH")
 
   if [[ -n "$BRANCH" && "$SKIP_PROMPTS" == "false" ]]; then
     local warnings=()
@@ -551,12 +562,9 @@ cmd_remove() {
     [[ "${in_use:-0}" -gt 0 ]] && \
       warnings+=("branch '$BRANCH' is checked out in another worktree")
 
-    # Local-only or open PR?
-    local pr_status
-    pr_status=$(_branch_pr_status "$COMMON_DIR" "$BRANCH")
     case "$pr_status" in
       local-only)
-        warnings+=("branch '$BRANCH' is local-only (no remote backup; branch is kept after removal)")
+        warnings+=("branch '$BRANCH' is local-only (no remote backup)")
         ;;
       open:*)
         local pr_info="${pr_status#open:}"
@@ -574,7 +582,7 @@ cmd_remove() {
       printf "Remove anyway? [y/N] " >&2
       local answer
       # /dev/tty: same reason as in _gc_branches — stdin may be a pipe.
-    read -r answer </dev/tty
+      read -r answer </dev/tty
       case "$answer" in
         [Yy]) ;;  # proceed with removal
         *)
@@ -598,8 +606,11 @@ cmd_remove() {
   # git calls getcwd() at startup and fatals if the process cwd is gone.
   cd "$DEST" 2>/dev/null || cd "$HOME"
 
-  # Post-removal gc: clean up branches from this worktree
-  _gc_branches "$COMMON_DIR" "$TARGET" "$SKIP_PROMPTS"
+  # Post-removal gc: clean up branches from this worktree.
+  # --delete-branch/-d skips the gc prompt (auto-deletes merged + local-only).
+  local gc_skip="$SKIP_PROMPTS"
+  [[ "$DELETE_BRANCH" == "true" ]] && gc_skip="true"
+  _gc_branches "$COMMON_DIR" "$TARGET" "$gc_skip"
 
   # stdout: directive consumed by the wt shell wrapper
   echo "rm:$TARGET:$DEST"
