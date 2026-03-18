@@ -297,14 +297,19 @@ _gc_branches() {
   local _i
   for ((_i=0; _i<_gc_n; _i++)); do
     local wt="${wt_order[$_i]}"
-    local display_wt="${wt/#$HOME/~}"
-    local wt_context="removed" ctx_color="$C_DIM"
-    if printf '%s\n' "$ACTIVE_WTS" | grep -Fqx "$wt" 2>/dev/null; then
-      wt_context="active"; ctx_color="$C_CYAN"
-    fi
 
-    printf "${C_BOLD}WORKTREE${C_RESET}  ${C_BOLD}%s${C_RESET}  ${ctx_color}[%s]${C_RESET}\n\n" \
-      "$display_wt" "$wt_context" >&2
+    if [[ "$wt" == "unknown" ]]; then
+      # Branches that predate 'wt setup' have no log entry; show a neutral header.
+      printf "${C_BOLD}WORKTREE${C_RESET}  ${C_DIM}(origin not tracked)${C_RESET}\n\n" >&2
+    else
+      local display_wt="${wt/#$HOME/~}"
+      local wt_context="removed" ctx_color="$C_DIM"
+      if printf '%s\n' "$ACTIVE_WTS" | grep -Fqx "$wt" 2>/dev/null; then
+        wt_context="active"; ctx_color="$C_CYAN"
+      fi
+      printf "${C_BOLD}WORKTREE${C_RESET}  ${C_BOLD}%s${C_RESET}  ${ctx_color}[%s]${C_RESET}\n\n" \
+        "$display_wt" "$wt_context" >&2
+    fi
     printf "  %-*s  %-10s  %-*s  %s\n" \
       "$col_branch" "BRANCH" "STATUS" "$col_pr" "PR" "ACTION" >&2
     printf "  %-*s  %-10s  %-*s  %s\n" \
