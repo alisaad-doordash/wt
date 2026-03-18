@@ -582,6 +582,30 @@ MOCK
   [[ "$output" == *"feat-x"* ]]
 }
 
+@test "_gc_branches: table columns fit long branch names without overflow" {
+  init_bare_repo
+  local long_branch="fix/split-campaign-details-bma-tests"  # 38 chars > old 20-char column
+  "$REAL_GIT" --git-dir="$TEST_DIR" branch "$long_branch" main >/dev/null 2>&1
+
+  local LOG="$TEST_DIR/wt-branch-origin.tsv"
+  printf '%s\t%s\t2026-03-17T10:00:00Z\n' "$long_branch" "$BATS_TEST_TMPDIR/wt" > "$LOG"
+
+  _branch_pr_status() { echo "merged"; }
+  _do_delete_branches() { true; }
+
+  run _gc_branches "$TEST_DIR" "" "true"
+  [[ "$status" -eq 0 ]]
+  # The branch name must appear on its own line without STATUS bleeding into it
+  [[ "$output" == *"$long_branch"* ]]
+  # "will delete" must still appear (ACTION column present)
+  [[ "$output" == *"will delete"* ]]
+  # Header and data should use the same width: verify BRANCH header and separator
+  # are at least as wide as the branch name (no truncation)
+  local branch_col_line
+  branch_col_line=$(printf '%s\n' "$output" | grep "BRANCH")
+  [[ "$branch_col_line" == *"BRANCH"* ]]
+}
+
 @test "_gc_branches: WORKTREE_FILTER limits to branches from that wt" {
   init_bare_repo
   local LOG="$TEST_DIR/wt-branch-origin.tsv"

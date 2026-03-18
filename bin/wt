@@ -272,6 +272,27 @@ _gc_branches() {
     return 0
   fi
 
+  # Two-pass: scan temp files to find max column widths, then render.
+  # Status is bounded ("local-only" = 10 chars); only BRANCH and PR vary.
+  local col_branch=6  # min = len("BRANCH")
+  local col_pr=2      # min = len("PR")
+  local _j
+  for ((_j=0; _j<_gc_n; _j++)); do
+    [[ -f "$_gc_tmpdir/$_j" ]] || continue
+    while IFS=$'\t' read -r _b _s _p; do
+      [[ -z "$_b" ]] && continue
+      [[ ${#_b} -gt $col_branch ]] && col_branch=${#_b}
+      [[ ${#_p} -gt $col_pr ]]     && col_pr=${#_p}
+    done < "$_gc_tmpdir/$_j"
+  done
+  # Cap PR at 50 chars; very long titles are truncated with '…' when printing.
+  [[ $col_pr -gt 50 ]] && col_pr=50
+
+  # Build separator strings — one '─' per column character.
+  local sep_branch="" sep_pr="" _k
+  for ((_k=0; _k<col_branch; _k++)); do sep_branch+='─'; done
+  for ((_k=0; _k<col_pr;     _k++)); do sep_pr+='─'; done
+
   # Display table grouped by originating worktree
   local _i
   for ((_i=0; _i<_gc_n; _i++)); do
@@ -284,9 +305,10 @@ _gc_branches() {
 
     printf "${C_BOLD}WORKTREE${C_RESET}  ${C_BOLD}%s${C_RESET}  ${ctx_color}[%s]${C_RESET}\n\n" \
       "$display_wt" "$wt_context" >&2
-    printf "  %-20s  %-10s  %-24s  %s\n" "BRANCH" "STATUS" "PR" "ACTION" >&2
-    printf "  %-20s  %-10s  %-24s  %s\n" \
-      "──────────────────" "────────" "──────────────────────" "────────────" >&2
+    printf "  %-*s  %-10s  %-*s  %s\n" \
+      "$col_branch" "BRANCH" "STATUS" "$col_pr" "PR" "ACTION" >&2
+    printf "  %-*s  %-10s  %-*s  %s\n" \
+      "$col_branch" "$sep_branch" "──────────" "$col_pr" "$sep_pr" "────────────" >&2
 
     [[ -f "$_gc_tmpdir/$_i" ]] && while IFS=$'\t' read -r branch status_label pr_info; do
       [[ -z "$branch" ]] && continue
@@ -302,8 +324,10 @@ _gc_branches() {
           status_color="$C_DIM"
           ;;
       esac
-      printf "  %-20s  ${status_color}%-10s${C_RESET}  %-24s  ${action_color}%s${C_RESET}\n" \
-        "$branch" "$status_label" "$pr_info" "$action" >&2
+      local pr_display="$pr_info"
+      [[ ${#pr_info} -gt $col_pr ]] && pr_display="${pr_info:0:$((col_pr-1))}…"
+      printf "  %-*s  ${status_color}%-10s${C_RESET}  %-*s  ${action_color}%s${C_RESET}\n" \
+        "$col_branch" "$branch" "$status_label" "$col_pr" "$pr_display" "$action" >&2
     done < "$_gc_tmpdir/$_i"
 
     echo "" >&2
