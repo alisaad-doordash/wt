@@ -556,7 +556,7 @@ cmd_remove() {
     pr_status=$(_branch_pr_status "$COMMON_DIR" "$BRANCH")
     case "$pr_status" in
       local-only)
-        warnings+=("branch '$BRANCH' has no remote tracking branch (local-only)")
+        warnings+=("branch '$BRANCH' is local-only (no remote backup; branch is kept after removal)")
         ;;
       open:*)
         local pr_info="${pr_status#open:}"
