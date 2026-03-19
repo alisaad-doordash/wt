@@ -615,8 +615,13 @@ cmd_remove() {
   fi
 
   echo "→ Removing worktree: $TARGET" >&2
-  git -C "$CWD" worktree remove --force "$TARGET" 1>&2
-  rm -rf "$TARGET"
+  # git worktree remove --force handles modified tracked files but refuses to
+  # delete non-empty directories (untracked files, node_modules, build output).
+  # Fall back to rm -rf + prune so those cases don't block removal.
+  git -C "$CWD" worktree remove --force "$TARGET" 1>&2 || {
+    rm -rf "$TARGET"
+    git -C "$CWD" worktree prune 1>&2
+  }
   # Clean up the parent directory if it's now empty. For regular repos the
   # worktree is named like "myrepo-feat-x/" and the parent is shared with other
   # worktrees, so rmdir is a no-op unless this was the last one.
