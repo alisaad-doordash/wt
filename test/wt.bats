@@ -828,25 +828,24 @@ MOCK
   [[ "$output" == *"1"* ]]  # row 1 is present
 }
 
-@test "_gc_branches: interactive prompt shows pre-selected default indices" {
+@test "_gc_branches: SKIP_PROMPTS=true auto-deletes pre-selected branches" {
+  # The interactive prompt reads from /dev/tty (can't feed it in bats).
+  # SKIP_PROMPTS=true exercises the same collection→delete path that accepting
+  # the default at the interactive prompt would take.
+  # Must use `run` so the RETURN trap in _gc_branches is scoped to the
+  # run subshell and doesn't fire for nested calls in the test's shell scope.
   init_bare_repo
   "$REAL_GIT" --git-dir="$TEST_DIR" branch feat-x main >/dev/null 2>&1
   local LOG="$TEST_DIR/wt-branch-origin.tsv"
   printf 'feat-x\t%s\t2026-03-17T10:00:00Z\n' "$BATS_TEST_TMPDIR/wt" > "$LOG"
 
   _branch_pr_status() { echo "merged"; }
-  _do_delete_branches() { true; }
+  _do_delete_branches() { echo "DELETED:$*" >&2; }
 
-  # Simulate pressing Enter (accept default) by feeding empty line
-  run bash -c "
-    export __WT_TESTS=1
-    source '$WT_BIN'
-    _branch_pr_status() { echo 'merged'; }
-    _do_delete_branches() { echo 'DELETED:\$@'; }
-    echo '' | _gc_branches '$TEST_DIR' '' 'false' 2>&1
-  "
-  # With empty input the default selection is used; merged branch should be deleted
-  [[ "$output" == *"DELETED"* ]] || [[ "$output" == *"Delete"* ]]
+  run _gc_branches "$TEST_DIR" "" "true"
+  [[ "$status" -eq 0 ]]
+  # _do_delete_branches should have been called with feat-x
+  [[ "$output" == *"DELETED"*"feat-x"* ]]
 }
 
 @test "cmd_branches: dynamic column widths for long branch names" {

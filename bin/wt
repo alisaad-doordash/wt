@@ -192,14 +192,31 @@ _gc_branches() {
   }
 
   # ── Data collection ──────────────────────────────────────────────────────────
+  # ── Progress tracking (only when stderr is a TTY) ───────────────────────────
+  # Inlined rather than nested functions — nested function returns trigger the
+  # RETURN trap set above when called in a direct (non-subshell) context,
+  # which prematurely deletes $_gc_tmpdir.
+  local _total=0 _checked=0 _show_progress=false
+  [[ -t 2 ]] && _show_progress=true
+
   if [[ -n "$WORKTREE_FILTER" ]]; then
     if [[ ! -f "$LOG" ]]; then
       echo "No tracked branches for this worktree (run 'wt setup' to enable tracking)." >&2
       return 0
     fi
+    # Pre-count candidates so the progress line shows N/M.
+    if [[ "$_show_progress" == "true" ]]; then
+      while IFS=$'\t' read -r _b _wt _ts; do
+        [[ "$_wt" == "$WORKTREE_FILTER" ]] || continue
+        printf '%s\n' "$ACTIVE_BRANCHES" | grep -Fqx "$_b" 2>/dev/null || _total=$((_total+1))
+      done < "$LOG"
+    fi
     while IFS=$'\t' read -r branch worktree ts; do
       [[ "$worktree" != "$WORKTREE_FILTER" ]] && continue
       printf '%s\n' "$ACTIVE_BRANCHES" | grep -Fqx "$branch" 2>/dev/null && continue
+      _checked=$((_checked+1))
+      [[ "$_show_progress" == "true" ]] && \
+        printf "\r\033[K  ${C_DIM}Checking %d/%d:${C_RESET} %s" "$_checked" "$_total" "$branch" >&2
       local status_raw="" pr_info="" status_label=""
       status_raw=$(_branch_pr_status "$COMMON_DIR" "$branch")
       case "$status_raw" in
@@ -217,13 +234,24 @@ _gc_branches() {
       local _gc_idx=0; _gc_wt_index "$worktree"
       printf '%s\t%s\t%s\n' "$branch" "$status_label" "$pr_info" >> "$_gc_tmpdir/$_gc_idx"
     done < "$LOG"
+    [[ "$_show_progress" == "true" ]] && printf "\r\033[K" >&2
   else
     local all_local_branches
     all_local_branches=$(git --git-dir="$COMMON_DIR" for-each-ref \
       --format='%(refname:short)' 'refs/heads/' 2>/dev/null || true)
+    # Pre-count non-active branches (those that will need a status API call).
+    if [[ "$_show_progress" == "true" ]]; then
+      while IFS= read -r _b; do
+        [[ -z "$_b" ]] && continue
+        printf '%s\n' "$ACTIVE_BRANCHES" | grep -Fqx "$_b" 2>/dev/null || _total=$((_total+1))
+      done <<< "$all_local_branches"
+    fi
     while IFS= read -r branch; do
       [[ -z "$branch" ]] && continue
       printf '%s\n' "$ACTIVE_BRANCHES" | grep -Fqx "$branch" 2>/dev/null && continue
+      _checked=$((_checked+1))
+      [[ "$_show_progress" == "true" ]] && \
+        printf "\r\033[K  ${C_DIM}Checking %d/%d:${C_RESET} %s" "$_checked" "$_total" "$branch" >&2
       local origin_wt="unknown"
       if [[ -f "$LOG" ]]; then
         local found_wt
@@ -247,6 +275,7 @@ _gc_branches() {
       local _gc_idx=0; _gc_wt_index "$origin_wt"
       printf '%s\t%s\t%s\n' "$branch" "$status_label" "$pr_info" >> "$_gc_tmpdir/$_gc_idx"
     done <<< "$all_local_branches"
+    [[ "$_show_progress" == "true" ]] && printf "\r\033[K" >&2
   fi
 
   if [[ $_gc_n -eq 0 ]]; then
@@ -673,6 +702,17 @@ cmd_branches() {
     wt_order[_br_n]="$_wt"; _br_idx=$_br_n; _br_n=$((_br_n + 1))
   }
 
+  # Progress: active branches are resolved locally (fast); only non-active ones
+  # need a gh API call. Pre-count them so we can show "Checking N/M: branch".
+  local _br_total=0 _br_checked=0 _br_show_progress=false
+  [[ -t 2 ]] && _br_show_progress=true
+  if "$_br_show_progress"; then
+    while IFS=$'\t' read -r _b _wt _ts; do
+      printf '%s\n' "$WORKTREE_BRANCHES" | grep -Fqx "$_b" 2>/dev/null \
+        || _br_total=$((_br_total+1))
+    done < "$LOG"
+  fi
+
   # Collection pass: resolve status + PR info upfront so we know column widths
   # before rendering. Status is stored as plain text; colors applied at render.
   while IFS=$'\t' read -r branch worktree ts; do
@@ -681,6 +721,10 @@ cmd_branches() {
     if printf '%s\n' "$WORKTREE_BRANCHES" | grep -Fqx "$branch" 2>/dev/null; then
       status_label="active"
     else
+      _br_checked=$((_br_checked+1))
+      "$_br_show_progress" && \
+        printf "\r\033[K  ${C_DIM}Checking %d/%d:${C_RESET} %s" \
+          "$_br_checked" "$_br_total" "$branch" >&2
       local raw
       raw=$(_branch_pr_status "$COMMON_DIR" "$branch")
       case "$raw" in
@@ -700,6 +744,7 @@ cmd_branches() {
     printf '%s\t%s\t%s\t%s\n' "$branch" "$date_short" "$status_label" "$pr_info" \
       >> "$_br_tmpdir/$_br_idx"
   done < "$LOG"
+  "$_br_show_progress" && printf "\r\033[K" >&2  # clear progress line
 
   [[ $col_pr -gt 50 ]] && col_pr=50
   local sep_branch sep_pr
