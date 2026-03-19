@@ -200,15 +200,15 @@ MOCK
   [[ "$output" == "none" ]]
 }
 
-@test "_branch_pr_status: merged PR → merged" {
+@test "_branch_pr_status: merged PR → merged:NUMBER" {
   init_bare_repo
   make_mock_git "origin/feat-x" "git@github.com:org/repo.git"
 
-  # Mock gh to report merged PR
+  # Mock gh: return PR number for the new jq filter (select(length>0)|.[0].number)
   cat > "$MOCK_BIN/gh" << 'MOCK'
 #!/usr/bin/env bash
 if [[ "$*" == *"--state merged"* ]]; then
-  echo "1"
+  echo "42"
 fi
 MOCK
   chmod +x "$MOCK_BIN/gh"
@@ -216,7 +216,7 @@ MOCK
 
   run _branch_pr_status "$TEST_DIR" "feat-x"
   [[ "$status" -eq 0 ]]
-  [[ "$output" == "merged" ]]
+  [[ "$output" == "merged:42" ]]
 }
 
 @test "_branch_pr_status: open PR → open:NUMBER:TITLE" {
@@ -226,7 +226,7 @@ MOCK
   cat > "$MOCK_BIN/gh" << 'MOCK'
 #!/usr/bin/env bash
 if [[ "$*" == *"--state merged"* ]]; then
-  echo "0"
+  echo ""   # empty = no merged PR (new filter returns number or empty, not count)
 elif [[ "$*" == *"--state open"* ]]; then
   echo "1234:My open PR"
 fi
@@ -246,7 +246,7 @@ MOCK
   cat > "$MOCK_BIN/gh" << 'MOCK'
 #!/usr/bin/env bash
 if [[ "$*" == *"--state merged"* ]]; then
-  echo "0"
+  echo ""   # empty = no merged PR
 elif [[ "$*" == *"--state open"* ]]; then
   echo ""
 fi
@@ -510,7 +510,7 @@ MOCK
   git -C "$TEST_DIR" worktree add -b feat-x "$WORKTREE" main >/dev/null 2>&1
 
   # Override _branch_pr_status to return merged
-  _branch_pr_status() { echo "merged"; }
+  _branch_pr_status() { echo "merged:1234"; }
 
   # Override git worktree list check (no other wt has the branch)
   cat > "$MOCK_BIN/git" << MOCK
@@ -620,7 +620,7 @@ MOCK
   _branch_pr_status() {
     local branch="$2"
     case "$branch" in
-      feat-x) echo "merged" ;;
+      feat-x) echo "merged:1234" ;;
       feat-y) echo "open:999:WIP" ;;
       *)      echo "none" ;;
     esac
@@ -643,7 +643,7 @@ MOCK
   local LOG="$TEST_DIR/wt-branch-origin.tsv"
   printf '%s\t%s\t2026-03-17T10:00:00Z\n' "$long_branch" "$BATS_TEST_TMPDIR/wt" > "$LOG"
 
-  _branch_pr_status() { echo "merged"; }
+  _branch_pr_status() { echo "merged:1234"; }
   _do_delete_branches() { true; }
 
   run _gc_branches "$TEST_DIR" "" "true"
@@ -702,7 +702,7 @@ MOCK
   printf 'branch-a\t%s\t2026-03-17T10:00:00Z\n' "$WT1" > "$LOG"
   printf 'branch-b\t%s\t2026-03-17T10:00:00Z\n' "$WT2" >> "$LOG"
 
-  _branch_pr_status() { echo "merged"; }
+  _branch_pr_status() { echo "merged:1234"; }
 
   cat > "$MOCK_BIN/git" << MOCK
 #!/usr/bin/env bash
@@ -751,7 +751,7 @@ MOCK
   local WT1="$BATS_TEST_TMPDIR/wt-feat-x"
   printf 'feat-x\t%s\t2026-03-10T12:00:00Z\n' "$WT1" > "$LOG"
 
-  _branch_pr_status() { echo "merged"; }
+  _branch_pr_status() { echo "merged:1234"; }
   resolve_common_dir() { echo "$TEST_DIR"; }
 
   run cmd_branches
@@ -771,7 +771,7 @@ MOCK
   printf 'branch-in-active\t%s\t2026-03-10T12:00:00Z\n' "$ACTIVE_WT" > "$LOG"
   printf 'branch-in-removed\t%s\t2026-03-10T12:00:00Z\n' "$REMOVED_WT" >> "$LOG"
 
-  _branch_pr_status() { echo "merged"; }
+  _branch_pr_status() { echo "merged:1234"; }
   resolve_common_dir() { echo "$TEST_DIR"; }
 
   run cmd_branches
@@ -784,7 +784,7 @@ MOCK
   local LOG="$TEST_DIR/wt-branch-origin.tsv"
   printf 'feat-x\t%s\t2026-03-10T12:00:00Z\n' "$BATS_TEST_TMPDIR/wt" > "$LOG"
 
-  _branch_pr_status() { echo "merged"; }
+  _branch_pr_status() { echo "merged:1234"; }
   resolve_common_dir() { echo "$TEST_DIR"; }
 
   run cmd_branches
@@ -846,7 +846,7 @@ MOCK
   local LOG="$TEST_DIR/wt-branch-origin.tsv"
   printf 'feat-x\t%s\t2026-03-10T12:00:00Z\n' "$BATS_TEST_TMPDIR/wt" > "$LOG"
 
-  _branch_pr_status() { echo "merged"; }
+  _branch_pr_status() { echo "merged:1234"; }
   resolve_common_dir() { echo "$TEST_DIR"; }
 
   # Capture via $() — stdout is not a TTY, so no ANSI codes should appear
@@ -873,7 +873,7 @@ MOCK
   local LOG="$TEST_DIR/wt-branch-origin.tsv"
   printf 'feat-x\t%s\t2026-03-17T10:00:00Z\n' "$BATS_TEST_TMPDIR/wt" > "$LOG"
 
-  _branch_pr_status() { echo "merged"; }
+  _branch_pr_status() { echo "merged:1234"; }
   _do_delete_branches() { true; }
 
   run _gc_branches "$TEST_DIR" "" "true"
@@ -892,7 +892,7 @@ MOCK
   local LOG="$TEST_DIR/wt-branch-origin.tsv"
   printf 'feat-x\t%s\t2026-03-17T10:00:00Z\n' "$BATS_TEST_TMPDIR/wt" > "$LOG"
 
-  _branch_pr_status() { echo "merged"; }
+  _branch_pr_status() { echo "merged:1234"; }
   _do_delete_branches() { echo "DELETED:$*" >&2; }
 
   run _gc_branches "$TEST_DIR" "" "true"
@@ -907,7 +907,7 @@ MOCK
   local long_branch="i18n_audience-expansion-badge-sidesheet"
   printf '%s\t%s\t2026-03-10T12:00:00Z\n' "$long_branch" "$BATS_TEST_TMPDIR/wt" > "$LOG"
 
-  _branch_pr_status() { echo "merged"; }
+  _branch_pr_status() { echo "merged:1234"; }
   resolve_common_dir() { echo "$TEST_DIR"; }
 
   run cmd_branches
@@ -923,7 +923,7 @@ MOCK
   local LOG="$TEST_DIR/wt-branch-origin.tsv"
   printf 'feat-x\t%s\t2026-03-10T12:00:00Z\n' "$BATS_TEST_TMPDIR/wt" > "$LOG"
 
-  _branch_pr_status() { echo "merged"; }
+  _branch_pr_status() { echo "merged:1234"; }
   resolve_common_dir() { echo "$TEST_DIR"; }
 
   # Capture output (not a TTY → no colors produced)

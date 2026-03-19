@@ -17,6 +17,20 @@ _sep() {
   for ((i=0; i<n; i++)); do printf '─'; done
 }
 
+# OSC 8 hyperlink: _link TEXT URL ENABLED
+# Wraps TEXT in a clickable hyperlink to URL when ENABLED is non-empty
+# (pass $C_RESET or equivalent — empty when not a TTY, non-empty when it is).
+# Terminals that don't support OSC 8 ignore the escape sequences and show TEXT.
+_link() {
+  local text="$1" url="$2" enabled="${3:-}"
+  if [[ -n "$url" && -n "$enabled" ]]; then
+    local e=$'\033'
+    printf '%s' "${e}]8;;${url}${e}\\${text}${e}]8;;${e}\\"
+  else
+    printf '%s' "$text"
+  fi
+}
+
 usage() {
   # Write to stderr so stdout stays clean for the shell wrapper's directive capture.
   # Exit code is parameterised: 0 for --help (success), 1 for unknown command (error).
@@ -111,11 +125,11 @@ _branch_pr_status() {
 
   # Check merged before open: most stale branches are merged, so this ordering
   # short-circuits the common case with one API call instead of two.
-  # Fall back to "0" if gh fails (unauthenticated, network error) so we don't crash.
-  local merged
-  merged=$(gh pr list --repo "$gh_repo" --head "$branch" --state merged \
-    --json number --jq 'length' 2>/dev/null || echo "0")
-  if [[ "$merged" -gt 0 ]]; then echo "merged" && return; fi
+  # Return merged:NUM so callers can construct a hyperlink to the PR.
+  local merged_num
+  merged_num=$(gh pr list --repo "$gh_repo" --head "$branch" --state merged \
+    --json number --jq 'select(length > 0) | .[0].number' 2>/dev/null || true)
+  if [[ -n "$merged_num" ]]; then echo "merged:$merged_num" && return; fi
 
   local open_pr
   open_pr=$(gh pr list --repo "$gh_repo" --head "$branch" --state open \
@@ -183,6 +197,14 @@ _gc_branches() {
   # Column widths — tracked inline during collection; no separate scan pass.
   local col_branch=6 col_pr=2  # minimums = header text lengths
 
+  # Base URL for constructing PR hyperlinks (computed once, used per-branch).
+  local _gh_base_url=""
+  local _remote_url
+  _remote_url=$(git --git-dir="$COMMON_DIR" remote get-url origin 2>/dev/null || true)
+  if [[ "$_remote_url" =~ github\.com[:/]([^/]+)/([^/.]+)(\.git)?$ ]]; then
+    _gh_base_url="https://github.com/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+  fi
+
   _gc_wt_index() {
     local _wt="$1" _i
     for ((_i=0; _i<_gc_n; _i++)); do
@@ -216,22 +238,28 @@ _gc_branches() {
       _checked=$((_checked+1))
       [[ "$_show_progress" == "true" ]] && \
         printf "\r\033[K  ${C_DIM}Checking %d/%d:${C_RESET} %s" "$_checked" "$_total" "$branch" >&2
-      local status_raw="" pr_info="" status_label=""
+      local status_raw="" pr_info="" pr_url="" status_label=""
       status_raw=$(_branch_pr_status "$COMMON_DIR" "$branch")
       case "$status_raw" in
-        merged)     status_label="merged";     delete_queue+=("$branch") ;;
+        merged:*)
+          local pr_num="${status_raw#merged:}"
+          status_label="merged"; delete_queue+=("$branch")
+          pr_info="#$pr_num"
+          [[ -n "$_gh_base_url" ]] && pr_url="$_gh_base_url/pull/$pr_num"
+          ;;
         local-only) status_label="local-only"; delete_queue+=("$branch") ;;
         open:*)
           local pr_num="${status_raw#open:}" pr_title=""
           pr_title="${pr_num#*:}"; pr_num="${pr_num%%:*}"
           status_label="open"; pr_info="#$pr_num \"$pr_title\""
+          [[ -n "$_gh_base_url" ]] && pr_url="$_gh_base_url/pull/$pr_num"
           ;;
         *) status_label="none" ;;
       esac
       [[ ${#branch}  -gt $col_branch ]] && col_branch=${#branch}
       [[ ${#pr_info} -gt $col_pr     ]] && col_pr=${#pr_info}
       local _gc_idx=0; _gc_wt_index "$worktree"
-      printf '%s\t%s\t%s\n' "$branch" "$status_label" "$pr_info" >> "$_gc_tmpdir/$_gc_idx"
+      printf '%s\t%s\t%s\t%s\n' "$branch" "$status_label" "$pr_info" "$pr_url" >> "$_gc_tmpdir/$_gc_idx"
     done < "$LOG"
     [[ "$_show_progress" == "true" ]] && printf "\r\033[K" >&2
   else
@@ -257,22 +285,28 @@ _gc_branches() {
         found_wt=$(awk -F'\t' -v b="$branch" '$1==b {print $2; exit}' "$LOG" || true)
         [[ -n "$found_wt" ]] && origin_wt="$found_wt"
       fi
-      local status_raw="" pr_info="" status_label=""
+      local status_raw="" pr_info="" pr_url="" status_label=""
       status_raw=$(_branch_pr_status "$COMMON_DIR" "$branch")
       case "$status_raw" in
-        merged)     status_label="merged"; delete_queue+=("$branch") ;;
+        merged:*)
+          local pr_num="${status_raw#merged:}"
+          status_label="merged"; delete_queue+=("$branch")
+          pr_info="#$pr_num"
+          [[ -n "$_gh_base_url" ]] && pr_url="$_gh_base_url/pull/$pr_num"
+          ;;
         local-only) status_label="local-only" ;;
         open:*)
           local pr_num="${status_raw#open:}" pr_title=""
           pr_title="${pr_num#*:}"; pr_num="${pr_num%%:*}"
           status_label="open"; pr_info="#$pr_num \"$pr_title\""
+          [[ -n "$_gh_base_url" ]] && pr_url="$_gh_base_url/pull/$pr_num"
           ;;
         *) status_label="none" ;;
       esac
       [[ ${#branch}  -gt $col_branch ]] && col_branch=${#branch}
       [[ ${#pr_info} -gt $col_pr     ]] && col_pr=${#pr_info}
       local _gc_idx=0; _gc_wt_index "$origin_wt"
-      printf '%s\t%s\t%s\n' "$branch" "$status_label" "$pr_info" >> "$_gc_tmpdir/$_gc_idx"
+      printf '%s\t%s\t%s\t%s\n' "$branch" "$status_label" "$pr_info" "$pr_url" >> "$_gc_tmpdir/$_gc_idx"
     done <<< "$all_local_branches"
     [[ "$_show_progress" == "true" ]] && printf "\r\033[K" >&2
   fi
@@ -308,7 +342,7 @@ _gc_branches() {
     printf "  %-3s  %-*s  %-10s  %-*s  %s\n" \
       "───" "$col_branch" "$sep_branch" "──────────" "$col_pr" "$sep_pr" "────────────" >&2
 
-    [[ -f "$_gc_tmpdir/$_i" ]] && while IFS=$'\t' read -r branch status_label pr_info; do
+    [[ -f "$_gc_tmpdir/$_i" ]] && while IFS=$'\t' read -r branch status_label pr_info pr_url; do
       [[ -z "$branch" ]] && continue
       _row_n=$((_row_n + 1))
       _display_branches[$_row_n]="$branch"
@@ -324,10 +358,13 @@ _gc_branches() {
         none)
           status_color="$C_DIM" ;;
       esac
-      local pr_display="$pr_info"
-      [[ ${#pr_info} -gt $col_pr ]] && pr_display="${pr_info:0:$((col_pr-1))}…"
-      printf "  %-3s  %-*s  ${status_color}%-10s${C_RESET}  %-*s  ${action_color}%s${C_RESET}\n" \
-        "$_row_n" "$col_branch" "$branch" "$status_label" "$col_pr" "$pr_display" "$action" >&2
+      # Truncate PR text to column width, then apply OSC 8 hyperlink if available.
+      # Use manual padding instead of %-*s because escape codes inflate byte count.
+      local pr_text="${pr_info:0:$col_pr}"
+      local pr_pad; printf -v pr_pad '%*s' $((col_pr - ${#pr_text})) ''
+      local pr_display; pr_display=$(_link "$pr_text" "$pr_url" "$C_RESET")
+      printf "  %-3s  %-*s  ${status_color}%-10s${C_RESET}  %s%s  ${action_color}%s${C_RESET}\n" \
+        "$_row_n" "$col_branch" "$branch" "$status_label" "$pr_display" "$pr_pad" "$action" >&2
     done < "$_gc_tmpdir/$_i"
     echo "" >&2
   done
@@ -793,6 +830,13 @@ cmd_branches() {
   # Column widths tracked inline during collection — no second scan pass.
   local col_branch=6 col_pr=2  # minimums = header text lengths
 
+  local _gh_base_url=""
+  local _remote_url
+  _remote_url=$(git --git-dir="$COMMON_DIR" remote get-url origin 2>/dev/null || true)
+  if [[ "$_remote_url" =~ github\.com[:/]([^/]+)/([^/.]+)(\.git)?$ ]]; then
+    _gh_base_url="https://github.com/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+  fi
+
   _br_wt_index() {
     local _wt="$1" _i
     for ((_i=0; _i<_br_n; _i++)); do
@@ -816,7 +860,7 @@ cmd_branches() {
   # before rendering. Status is stored as plain text; colors applied at render.
   while IFS=$'\t' read -r branch worktree ts; do
     local date_short="${ts%%T*}"
-    local status_label="" pr_info=""
+    local status_label="" pr_info="" pr_url=""
     if printf '%s\n' "$WORKTREE_BRANCHES" | grep -Fqx "$branch" 2>/dev/null; then
       status_label="active"
     else
@@ -827,12 +871,17 @@ cmd_branches() {
       local raw
       raw=$(_branch_pr_status "$COMMON_DIR" "$branch")
       case "$raw" in
-        merged)     status_label="merged" ;;
+        merged:*)
+          local pr_num="${raw#merged:}"
+          status_label="merged"; pr_info="#$pr_num"
+          [[ -n "$_gh_base_url" ]] && pr_url="$_gh_base_url/pull/$pr_num"
+          ;;
         local-only) status_label="local-only" ;;
         open:*)
           local pr_num="${raw#open:}" pr_title=""
           pr_title="${pr_num#*:}"; pr_num="${pr_num%%:*}"
           status_label="open"; pr_info="#$pr_num \"$pr_title\""
+          [[ -n "$_gh_base_url" ]] && pr_url="$_gh_base_url/pull/$pr_num"
           ;;
         *) status_label="unknown" ;;
       esac
@@ -840,7 +889,7 @@ cmd_branches() {
     [[ ${#branch}  -gt $col_branch ]] && col_branch=${#branch}
     [[ ${#pr_info} -gt $col_pr     ]] && col_pr=${#pr_info}
     local _br_idx=0; _br_wt_index "$worktree"
-    printf '%s\t%s\t%s\t%s\n' "$branch" "$date_short" "$status_label" "$pr_info" \
+    printf '%s\t%s\t%s\t%s\t%s\n' "$branch" "$date_short" "$status_label" "$pr_info" "$pr_url" \
       >> "$_br_tmpdir/$_br_idx"
   done < "$LOG"
   "$_br_show_progress" && printf "\r\033[K" >&2  # clear progress line
@@ -863,7 +912,7 @@ cmd_branches() {
     printf "  %-*s  %-10s  %-10s  %s\n" \
       "$col_branch" "$sep_branch" "──────────" "──────────" "$sep_pr"
 
-    [[ -f "$_br_tmpdir/$_i" ]] && while IFS=$'\t' read -r branch date_short status_label pr_info; do
+    [[ -f "$_br_tmpdir/$_i" ]] && while IFS=$'\t' read -r branch date_short status_label pr_info pr_url; do
       [[ -z "$branch" ]] && continue
       local status_color=""
       case "$status_label" in
@@ -873,10 +922,11 @@ cmd_branches() {
         local-only) status_color="$D"  ;;
         *)          status_color="$D"  ;;
       esac
-      local pr_display="$pr_info"
-      [[ ${#pr_info} -gt $col_pr ]] && pr_display="${pr_info:0:$((col_pr-1))}…"
-      printf "  %-*s  %-10s  ${status_color}%-10s${R}  %s\n" \
-        "$col_branch" "$branch" "$date_short" "$status_label" "$pr_display"
+      local pr_text="${pr_info:0:$col_pr}"
+      local pr_pad; printf -v pr_pad '%*s' $((col_pr - ${#pr_text})) ''
+      local pr_display; pr_display=$(_link "$pr_text" "$pr_url" "$R")
+      printf "  %-*s  %-10s  ${status_color}%-10s${R}  %s%s\n" \
+        "$col_branch" "$branch" "$date_short" "$status_label" "$pr_display" "$pr_pad"
     done < "$_br_tmpdir/$_i"
 
     echo ""
