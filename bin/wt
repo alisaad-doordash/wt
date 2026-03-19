@@ -616,9 +616,17 @@ cmd_remove() {
   echo "→ Removing worktree: $TARGET" >&2
   # git worktree remove --force handles modified tracked files but refuses to
   # delete non-empty directories (untracked files, node_modules, build output).
-  # Fall back to rm -rf + prune so those cases don't block removal.
+  # Fall back to manual deletion + prune.
+  #
+  # BSD rm -rf (macOS) builds full paths internally via FTS and fails when they
+  # exceed PATH_MAX (~1024 bytes). pnpm's .pnpm virtual store creates paths like
+  # .pnpm/@scope+pkg@version+peers/node_modules/... that routinely hit this.
+  # `find -depth -delete` avoids the issue by working relative to each parent.
+  _wt_rm_dir() {
+    rm -rf "$1" 2>/dev/null || find "$1" -depth -delete 2>/dev/null || true
+  }
   git -C "$CWD" worktree remove --force "$TARGET" 1>&2 || {
-    rm -rf "$TARGET"
+    _wt_rm_dir "$TARGET"
     git -C "$CWD" worktree prune 1>&2
   }
   # Clean up the parent directory if it's now empty. For regular repos the
