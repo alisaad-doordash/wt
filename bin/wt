@@ -564,57 +564,82 @@ cmd_remove() {
     DEST=$(dirname "$COMMON_DIR")
   fi
 
+  # Resolve the gitdir entry early — needed for the lock check below and for
+  # the removal step. A linked worktree's .git is a plain file: "gitdir: /path"
+  local _gitdir_entry=""
+  if [[ -f "$TARGET/.git" ]]; then
+    _gitdir_entry=$(sed 's/^gitdir: //' "$TARGET/.git" 2>/dev/null || true)
+    if [[ -n "$_gitdir_entry" && "$_gitdir_entry" != /* ]]; then
+      _gitdir_entry="$(cd "$TARGET" 2>/dev/null && \
+        cd "$_gitdir_entry" 2>/dev/null && pwd)" || _gitdir_entry=""
+    fi
+  fi
+
   # Pre-removal warning check
   local BRANCH="" pr_status=""
   BRANCH=$(git -C "$TARGET" symbolic-ref --short HEAD 2>/dev/null || true)
   # Fetch pr_status unconditionally — needed for post-removal branch cleanup too.
   [[ -n "$BRANCH" ]] && pr_status=$(_branch_pr_status "$COMMON_DIR" "$BRANCH")
 
-  if [[ -n "$BRANCH" && "$SKIP_PROMPTS" == "false" ]]; then
+  if [[ "$SKIP_PROMPTS" == "false" ]]; then
     local warnings=()
 
-    # Checked out in another worktree?
-    local in_use
-    in_use=$(git --git-dir="$COMMON_DIR" worktree list --porcelain | awk \
-      -v branch="refs/heads/$BRANCH" -v target="$TARGET" '
-      /^worktree / { wt=$2 }
-      /^branch /   { if ($2==branch && wt != target) found++ }
-      END           { print found+0 }
-    ')
-    [[ "${in_use:-0}" -gt 0 ]] && \
-      warnings+=("branch '$BRANCH' is checked out in another worktree")
+    # Locked worktree? git worktree lock writes a 'locked' file in the gitdir
+    # entry. We bypass git's removal machinery entirely, so we must check this
+    # ourselves. --yes/-y overrides the lock (same as git worktree remove -f -f).
+    if [[ -n "$_gitdir_entry" && -f "$_gitdir_entry/locked" ]]; then
+      local lock_reason
+      lock_reason=$(cat "$_gitdir_entry/locked" 2>/dev/null || true)
+      if [[ -n "$lock_reason" ]]; then
+        warnings+=("worktree is locked: $lock_reason")
+      else
+        warnings+=("worktree is locked (no reason given)")
+      fi
+    fi
 
-    case "$pr_status" in
-      local-only)
-        warnings+=("branch '$BRANCH' is local-only (no remote backup)")
-        ;;
-      open:*)
-        local pr_info="${pr_status#open:}"
-        local pr_num="${pr_info%%:*}"
-        local pr_title="${pr_info#*:}"
-        warnings+=("branch '$BRANCH' has an open PR: #$pr_num \"$pr_title\"")
-        ;;
-    esac
+    if [[ -n "$BRANCH" ]]; then
+      # Checked out in another worktree?
+      local in_use
+      in_use=$(git --git-dir="$COMMON_DIR" worktree list --porcelain | awk \
+        -v branch="refs/heads/$BRANCH" -v target="$TARGET" '
+        /^worktree / { wt=$2 }
+        /^branch /   { if ($2==branch && wt != target) found++ }
+        END           { print found+0 }
+      ')
+      [[ "${in_use:-0}" -gt 0 ]] && \
+        warnings+=("branch '$BRANCH' is checked out in another worktree")
 
-    # Also warn about other local-only branches tracked for this worktree in the
-    # log — a worktree accumulates multiple branches over its lifetime.
-    local LOG="$COMMON_DIR/wt-branch-origin.tsv"
-    if [[ -f "$LOG" ]]; then
-      while IFS=$'\t' read -r b wt _ts; do
-        [[ "$wt" != "$TARGET" ]] && continue
-        [[ "$b" == "$BRANCH" ]] && continue  # already handled above
-        # Only warn if the branch still exists and has no upstream
-        git --git-dir="$COMMON_DIR" rev-parse "refs/heads/$b" >/dev/null 2>&1 || continue
-        local _upstream
-        _upstream=$(git --git-dir="$COMMON_DIR" for-each-ref \
-          --format='%(upstream:short)' "refs/heads/$b" 2>/dev/null || true)
-        [[ -z "$_upstream" ]] && \
-          warnings+=("branch '$b' is also local-only (tracked in this worktree)")
-      done < "$LOG"
+      case "$pr_status" in
+        local-only)
+          warnings+=("branch '$BRANCH' is local-only (no remote backup)")
+          ;;
+        open:*)
+          local pr_info="${pr_status#open:}"
+          local pr_num="${pr_info%%:*}"
+          local pr_title="${pr_info#*:}"
+          warnings+=("branch '$BRANCH' has an open PR: #$pr_num \"$pr_title\"")
+          ;;
+      esac
+
+      # Also warn about other local-only branches tracked for this worktree in
+      # the log — a worktree accumulates multiple branches over its lifetime.
+      local LOG="$COMMON_DIR/wt-branch-origin.tsv"
+      if [[ -f "$LOG" ]]; then
+        while IFS=$'\t' read -r b wt _ts; do
+          [[ "$wt" != "$TARGET" ]] && continue
+          [[ "$b" == "$BRANCH" ]] && continue  # already handled above
+          git --git-dir="$COMMON_DIR" rev-parse "refs/heads/$b" >/dev/null 2>&1 || continue
+          local _upstream
+          _upstream=$(git --git-dir="$COMMON_DIR" for-each-ref \
+            --format='%(upstream:short)' "refs/heads/$b" 2>/dev/null || true)
+          [[ -z "$_upstream" ]] && \
+            warnings+=("branch '$b' is also local-only (tracked in this worktree)")
+        done < "$LOG"
+      fi
     fi
 
     if [[ ${#warnings[@]} -gt 0 ]]; then
-      printf "${C_BOLD}Warning: removing worktree with active branch:${C_RESET}\n" >&2
+      printf "${C_BOLD}Warning: removing worktree:${C_RESET}\n" >&2
       for w in "${warnings[@]}"; do
         printf "  ${C_YELLOW}!${C_RESET} %s\n" "$w" >&2
       done
@@ -638,20 +663,7 @@ cmd_remove() {
   # De-register the worktree from git WITHOUT using 'git worktree remove'.
   # That command performs a full dirty-file scan (git ls-files --others) before
   # deleting, which is O(files) — minutes on a large monorepo.
-  #
-  # Instead: read the gitdir entry from $TARGET/.git (a plain text file in
-  # linked worktrees), delete that tiny metadata dir, done. Git will no longer
-  # list the worktree. Then dispatch the actual directory deletion to a
-  # background process so the user isn't blocked.
-  local _gitdir_entry=""
-  if [[ -f "$TARGET/.git" ]]; then
-    _gitdir_entry=$(sed 's/^gitdir: //' "$TARGET/.git" 2>/dev/null || true)
-    # git may write relative paths (e.g. "../.git/worktrees/name"); resolve.
-    if [[ -n "$_gitdir_entry" && "$_gitdir_entry" != /* ]]; then
-      _gitdir_entry="$(cd "$TARGET" 2>/dev/null && \
-        cd "$_gitdir_entry" 2>/dev/null && pwd)" || _gitdir_entry=""
-    fi
-  fi
+  # _gitdir_entry was already resolved above (for the lock check).
 
   if [[ -n "$_gitdir_entry" && -d "$_gitdir_entry" ]]; then
     rm -rf "$_gitdir_entry"   # instant: this is a tiny ~5-file metadata dir

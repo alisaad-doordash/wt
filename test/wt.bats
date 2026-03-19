@@ -451,6 +451,59 @@ MOCK
 # 6. cmd_remove pre-removal warnings
 # ---------------------------------------------------------------------------
 
+@test "wt rm: warns when worktree is locked (no reason)" {
+  # Simulate a locked worktree by creating the gitdir entry with a 'locked' file
+  local FAKE_WT="$BATS_TEST_TMPDIR/fake-wt"
+  local GITDIR_ENTRY="$BATS_TEST_TMPDIR/gitdir-entry"
+  mkdir -p "$FAKE_WT" "$GITDIR_ENTRY"
+  printf 'gitdir: %s\n' "$GITDIR_ENTRY" > "$FAKE_WT/.git"
+  touch "$GITDIR_ENTRY/locked"
+
+  local warnings=()
+  local _gitdir_entry="$GITDIR_ENTRY"
+  if [[ -n "$_gitdir_entry" && -f "$_gitdir_entry/locked" ]]; then
+    local lock_reason
+    lock_reason=$(cat "$_gitdir_entry/locked" 2>/dev/null || true)
+    if [[ -n "$lock_reason" ]]; then
+      warnings+=("worktree is locked: $lock_reason")
+    else
+      warnings+=("worktree is locked (no reason given)")
+    fi
+  fi
+  [[ ${#warnings[@]} -eq 1 ]]
+  [[ "${warnings[0]}" == *"locked"* ]]
+}
+
+@test "wt rm: warns when worktree is locked with reason" {
+  local GITDIR_ENTRY="$BATS_TEST_TMPDIR/gitdir-entry-reason"
+  mkdir -p "$GITDIR_ENTRY"
+  printf 'on remote mount\n' > "$GITDIR_ENTRY/locked"
+
+  local warnings=()
+  local _gitdir_entry="$GITDIR_ENTRY"
+  if [[ -n "$_gitdir_entry" && -f "$_gitdir_entry/locked" ]]; then
+    local lock_reason
+    lock_reason=$(cat "$_gitdir_entry/locked" 2>/dev/null || true)
+    [[ -n "$lock_reason" ]] \
+      && warnings+=("worktree is locked: $lock_reason") \
+      || warnings+=("worktree is locked (no reason given)")
+  fi
+  [[ ${#warnings[@]} -eq 1 ]]
+  [[ "${warnings[0]}" == *"on remote mount"* ]]
+}
+
+@test "wt rm: no warning when worktree is not locked" {
+  local GITDIR_ENTRY="$BATS_TEST_TMPDIR/gitdir-entry-unlocked"
+  mkdir -p "$GITDIR_ENTRY"
+  # No 'locked' file
+
+  local warnings=()
+  local _gitdir_entry="$GITDIR_ENTRY"
+  [[ -n "$_gitdir_entry" && -f "$_gitdir_entry/locked" ]] \
+    && warnings+=("locked")
+  [[ ${#warnings[@]} -eq 0 ]]
+}
+
 @test "wt rm: no warning when branch is merged" {
   init_bare_repo
   local WORKTREE="$BATS_TEST_TMPDIR/worktree"
