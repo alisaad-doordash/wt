@@ -426,6 +426,8 @@ cmd_ls() {
   local cwd current
   cwd=$(pwd)
   current=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || echo "")
+  local COMMON_DIR
+  COMMON_DIR=$(resolve_common_dir "$cwd")
 
   # Two-pass awk to align branch names in a column:
   # We can't know the longest path until all rows are read, so we buffer
@@ -470,6 +472,23 @@ cmd_ls() {
       }
     }
   '
+
+  # Append any worktrees currently being background-deleted.
+  local _pending_dir="$COMMON_DIR/wt-pending-delete"
+  if [[ -d "$_pending_dir" ]]; then
+    local _marker _path
+    for _marker in "$_pending_dir"/*; do
+      [[ -f "$_marker" ]] || continue
+      _path=$(cat "$_marker" 2>/dev/null) || continue
+      [[ -n "$_path" ]] || continue
+      if [[ -d "$_path" ]]; then
+        printf "${C_DIM}  %s [deleting…]${C_RESET}\n" "${_path/#$HOME/~}"
+      else
+        # Directory already gone — stale marker, clean it up silently.
+        rm -f "$_marker" 2>/dev/null || true
+      fi
+    done
+  fi
 }
 
 cmd_cd() {
@@ -642,6 +661,14 @@ cmd_remove() {
       git -C "$CWD" worktree prune 1>&2 || true
   fi
 
+  # Write a marker file so 'wt ls' can show [deleting…] while the background
+  # process is running. The background process removes it on success; a stale
+  # marker (directory already gone) is cleaned up lazily by 'wt ls'.
+  local _pending_dir="$COMMON_DIR/wt-pending-delete"
+  local _marker_file="$_pending_dir/$(basename "$TARGET")"
+  mkdir -p "$_pending_dir"
+  printf '%s\n' "$TARGET" > "$_marker_file"
+
   # Background the actual directory deletion.
   # BSD rm -rf fails on pnpm .pnpm paths that exceed PATH_MAX; fall back to
   # find -depth -delete which works relative to each parent directory.
@@ -650,6 +677,8 @@ cmd_remove() {
       || find "$TARGET" -depth -delete 2>/dev/null \
       || true
     rmdir "$_wt_parent" 2>/dev/null || true
+    # Remove marker only when the directory is actually gone.
+    [[ ! -d "$TARGET" ]] && rm -f "$_marker_file"
   ) &
   disown 2>/dev/null || true
   printf "→ Deregistered worktree; deleting %s in the background\n" \

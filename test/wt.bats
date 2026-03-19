@@ -880,6 +880,36 @@ MOCK
   [[ "$out" != *$'\033['* ]]
 }
 
+@test "cmd_ls: shows [deleting…] for worktrees with pending-delete marker" {
+  init_bare_repo
+  local PENDING_DIR="$TEST_DIR/wt-pending-delete"
+  local FAKE_WT="$BATS_TEST_TMPDIR/fake-wt"
+  mkdir -p "$PENDING_DIR" "$FAKE_WT"
+  printf '%s\n' "$FAKE_WT" > "$PENDING_DIR/fake-wt"
+
+  resolve_common_dir() { echo "$TEST_DIR"; }
+
+  run cmd_ls
+  [[ "$output" == *"deleting"* ]]
+  [[ "$output" == *"fake-wt"* ]]
+}
+
+@test "cmd_ls: silently removes stale marker when directory is already gone" {
+  init_bare_repo
+  local PENDING_DIR="$TEST_DIR/wt-pending-delete"
+  mkdir -p "$PENDING_DIR"
+  # Write a marker for a path that no longer exists
+  printf '%s\n' "/nonexistent/path/that/is/gone" > "$PENDING_DIR/gone-wt"
+
+  resolve_common_dir() { echo "$TEST_DIR"; }
+
+  run cmd_ls
+  # Stale marker must be cleaned up
+  [[ ! -f "$PENDING_DIR/gone-wt" ]]
+  # No [deleting…] annotation for a gone directory
+  [[ "$output" != *"deleting"* ]]
+}
+
 @test "answer prompt: case [Yy] accepts y and Y, rejects n N and empty" {
   # Tests the case pattern used in _gc_branches and cmd_remove prompts.
   # Replaces '${answer,,} == y' (bash 4.0+) for bash 3.2 compat.
