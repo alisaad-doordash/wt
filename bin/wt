@@ -201,8 +201,7 @@ _gc_branches() {
 
   if [[ -n "$WORKTREE_FILTER" ]]; then
     if [[ ! -f "$LOG" ]]; then
-      echo "No tracked branches for this worktree (run 'wt setup' to enable tracking)." >&2
-      return 0
+      return 0  # no log; cmd_remove handles the current branch directly
     fi
     # Pre-count candidates so the progress line shows N/M.
     if [[ "$_show_progress" == "true" ]]; then
@@ -637,6 +636,32 @@ cmd_remove() {
   local gc_skip="$SKIP_PROMPTS"
   [[ "$DELETE_BRANCH" == "true" ]] && gc_skip="true"
   _gc_branches "$COMMON_DIR" "$TARGET" "$gc_skip"
+
+  # Fallback: if the current branch is local-only and wasn't covered by
+  # _gc_branches (e.g. created before 'wt setup' so it's not in the log),
+  # offer to delete it directly.
+  if [[ -n "$BRANCH" && "$pr_status" == "local-only" ]]; then
+    local LOG="$COMMON_DIR/wt-branch-origin.tsv"
+    local in_log=false
+    if [[ -f "$LOG" ]] && \
+       awk -F'\t' -v b="$BRANCH" -v wt="$TARGET" \
+         '$1==b && $2==wt {found=1} END {exit !found}' "$LOG" 2>/dev/null; then
+      in_log=true
+    fi
+    if [[ "$in_log" == "false" ]] && \
+       git --git-dir="$COMMON_DIR" rev-parse "refs/heads/$BRANCH" >/dev/null 2>&1; then
+      if [[ "$gc_skip" == "true" ]]; then
+        _do_delete_branches "$COMMON_DIR" "$BRANCH"
+      else
+        printf "Delete local branch '${C_BOLD}%s${C_RESET}'? [y/N] " "$BRANCH" >&2
+        local del_answer
+        read -r del_answer </dev/tty
+        case "$del_answer" in
+          [Yy]) _do_delete_branches "$COMMON_DIR" "$BRANCH" ;;
+        esac
+      fi
+    fi
+  fi
 
   # stdout: directive consumed by the wt shell wrapper
   echo "rm:$TARGET:$DEST"
