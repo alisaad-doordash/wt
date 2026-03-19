@@ -614,26 +614,30 @@ cmd_remove() {
   fi
 
   echo "→ Removing worktree: $TARGET" >&2
-  # git worktree remove --force handles modified tracked files but refuses to
-  # delete non-empty directories (untracked files, node_modules, build output).
-  # Fall back to manual deletion + prune.
-  #
-  # BSD rm -rf (macOS) builds full paths internally via FTS and fails when they
-  # exceed PATH_MAX (~1024 bytes). pnpm's .pnpm virtual store creates paths like
-  # .pnpm/@scope+pkg@version+peers/node_modules/... that routinely hit this.
-  # `find -depth -delete` avoids the issue by working relative to each parent.
-  _wt_rm_dir() {
-    rm -rf "$1" 2>/dev/null || find "$1" -depth -delete 2>/dev/null || true
-  }
-  git -C "$CWD" worktree remove --force "$TARGET" 1>&2 || {
-    _wt_rm_dir "$TARGET"
+  local _wt_parent; _wt_parent="$(dirname "$TARGET")"
+
+  if git -C "$CWD" worktree remove --force "$TARGET" 2>/dev/null 1>&2; then
+    # git cleaned up the directory (small/clean worktree). Done synchronously.
+    rmdir "$_wt_parent" 2>/dev/null || true
+    echo "→ Removed: $TARGET" >&2
+  else
+    # Non-empty directory (node_modules, build output, pnpm .pnpm store).
+    # De-register from git immediately so git commands no longer see it, then
+    # dispatch the actual deletion to a background process — for a large monorepo
+    # like web-next, rm -rf can take minutes and the user shouldn't wait.
+    # BSD rm -rf also fails on very long pnpm paths (PATH_MAX); fall back to
+    # `find -depth -delete` which works relative to each parent directory.
     git -C "$CWD" worktree prune 1>&2
-  }
-  # Clean up the parent directory if it's now empty. For regular repos the
-  # worktree is named like "myrepo-feat-x/" and the parent is shared with other
-  # worktrees, so rmdir is a no-op unless this was the last one.
-  rmdir "$(dirname "$TARGET")" 2>/dev/null || true
-  echo "→ Removed: $TARGET" >&2
+    (
+      rm -rf "$TARGET" 2>/dev/null \
+        || find "$TARGET" -depth -delete 2>/dev/null \
+        || true
+      rmdir "$_wt_parent" 2>/dev/null || true
+    ) &
+    disown 2>/dev/null || true
+    printf "→ Unregistered worktree; deleting %s in the background\n" \
+      "${TARGET/#$HOME/~}" >&2
+  fi
 
   # cd away from the deleted directory before any further git operations;
   # git calls getcwd() at startup and fatals if the process cwd is gone.
